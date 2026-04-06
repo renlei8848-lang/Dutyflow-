@@ -8,7 +8,9 @@
       "Bash(bash --norc --noprofile -c 'cd \"D:/SoftwareCode/MyCyberLab/DutyFlow\\(small\\)\" && uv venv --python \"D:/SoftwareCode/MyCyberLab/GlobalCache/uv_python/cpython-3.12.13-windows-x86_64-none/python.exe\" .venv')",
       "Bash(bash:*)",
       "Bash(uv pip:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)"
     ]
   }
 }

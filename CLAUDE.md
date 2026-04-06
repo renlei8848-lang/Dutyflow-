@@ -69,30 +69,33 @@ Never trust memory of previous sessions — always re-read.
 - All solver parameters (time limit, num workers, etc.) must come from `PARAMS_REGISTRY.yaml`.
 
 ### 4.5 Documentation Sync
-- After any structural change (new file, renamed module, changed constant), update **all** of the following in the same response:
-  - `.dutyflow_meta/PROGRAM_TREE.md` + `.dutyflow_meta（中文for开发者）/PROGRAM_TREE.md`
-  - `.dutyflow_meta/PARAMS_REGISTRY.yaml` + `.dutyflow_meta（中文for开发者）/PARAMS_REGISTRY.yaml` (if constants changed)
-  - `.dutyflow_meta/ARCHITECTURE.md` + `.dutyflow_meta（中文for开发者）/ARCHITECTURE.md` (if module status changed)
-  - `CLAUDE(中文for开发者).md` (if any section in this file changed)
-- Claude reads only the English `.dutyflow_meta/` and `CLAUDE.md`.
-  The Chinese mirrors (`.dutyflow_meta（中文for开发者）/` and `CLAUDE(中文for开发者).md`) are for the human developer — but they must be kept in sync.
+After any change, update **all** applicable files in the same response:
+
+| Trigger | Files to update |
+|---|---|
+| File added / removed / renamed | `.dutyflow_meta/PROGRAM_TREE.md` + Chinese mirror |
+| Constant added / changed | `.dutyflow_meta/PARAMS_REGISTRY.yaml` + Chinese mirror |
+| Module status changed | `.dutyflow_meta/ARCHITECTURE.md` + Chinese mirror |
+| New debt / todo introduced or resolved | `.dutyflow_meta/TECHNICAL_DEBT_&_TODO.md` + Chinese mirror |
+| Any section in `CLAUDE.md` changed | `CLAUDE(中文for开发者).md` |
+
+Claude reads only the English `.dutyflow_meta/` and `CLAUDE.md`.
+Chinese mirrors are for the human developer — but must stay in sync.
 
 ---
 
 ## 5. Core Coding Conventions
 
 ### Module Boundaries
-```
-poc_loader.py      ← Phase 1: dirty data in, List[TeacherRecord] out. No solver logic.
-rules.json         ← Phase 2: static slot/constraint config. No Python logic.
-poc_solver.py      ← Phase 3: CP-SAT engine. Accepts TeacherRecord list + rules dict. No I/O.
-main.py            ← Orchestrator only. Calls Phase 1→2→3 in sequence. No business logic.
-```
+Do not cross these boundaries — see `ARCHITECTURE.md` for what each module does:
+- No solver logic in `poc_loader.py`
+- No I/O or data-loading in `poc_solver.py`
+- No business logic in `main.py` (orchestrator only)
+- No Python logic in `rules.json`
 
 ### Data Structures
-- `TeacherRecord` is a frozen dataclass. Fields must not be mutated after construction.
-- All "unavailability" info (leave, day-off preferences) is resolved to `Set[Tuple[int,int]]`
-  (week_index, day_index) by `poc_loader.py` before reaching the solver.
+- `TeacherRecord` is a frozen dataclass — never mutate fields after construction.
+- Field definitions and solver output schema live in `.dutyflow_meta/ARCHITECTURE.md`.
 
 ### Error Handling
 - `poc_loader.py`: raise `ValueError` with row number on any unresolvable dirty cell.
@@ -143,39 +146,20 @@ Before installing any new library:
 
 ---
 
-## 7. Three-Phase Data Flow (Immutable)
-
-```
-[Raw Excel/CSV]
-      │
-      ▼  poc_loader.py
-[List[TeacherRecord]]  ←→  [rules.json]
-      │
-      ▼  poc_solver.py (CP-SAT)
-[Schedule Matrix: teacher × day × slot]
-      │
-      ▼  main.py / Streamlit
-[Output: console table / HTML render]
-```
-
-This flow is linear and single-pass. There is no feedback loop between phases at runtime.
-
----
-
-## 8. Plan Mode Rules
+## 7. Plan Mode Rules
 
 When operating in **Plan Mode** (i.e., designing an approach before writing code):
 
-### 8.1 Output Must Be Minimal
+### 7.1 Output Must Be Minimal
 - State only: what will be changed, which files are affected, and why.
 - Use bullet points or a short numbered list. No paragraphs.
 - No code blocks, no diffs, no inline snippets in plan output.
 
-### 8.2 No Code in Plan Output
+### 7.2 No Code in Plan Output
 - Never output actual code, function bodies, or line-by-line changes during planning.
 - If a specific API signature is critical to the plan, mention the function name only — not its implementation.
 
-### 8.3 Plan Format (required)
+### 7.3 Plan Format (required)
 ```
 Files affected: <comma-separated list>
 Changes:
@@ -185,6 +169,6 @@ Rationale: <one sentence max>
 Risks / blockers: <one sentence, or "none">
 ```
 
-### 8.4 Confirm Before Executing
+### 7.4 Confirm Before Executing
 - After presenting the plan, wait for explicit user approval before writing any code.
 - If the user says "go" / "ok" / "proceed", begin implementation immediately without re-summarizing the plan.

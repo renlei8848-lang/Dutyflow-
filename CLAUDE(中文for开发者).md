@@ -70,31 +70,33 @@
 - 所有求解器参数（时间限制、工作线程数等）必须来自 `PARAMS_REGISTRY.yaml`。
 
 ### 4.5 文档同步协议
-修改任何结构（新增文件、重命名模块、修改常量）后，必须在同一次响应中更新以下**全部**文件：
-- `.dutyflow_meta/PROGRAM_TREE.md` + `.dutyflow_meta（中文for开发者）/PROGRAM_TREE.md`
-- `.dutyflow_meta/PARAMS_REGISTRY.yaml` + `.dutyflow_meta（中文for开发者）/PARAMS_REGISTRY.yaml`（如常量有变）
-- `.dutyflow_meta/ARCHITECTURE.md` + `.dutyflow_meta（中文for开发者）/ARCHITECTURE.md`（如模块状态有变）
-- `CLAUDE(中文for开发者).md`（如本文件对应的英文版有变）
+发生任何变更后，必须在同一次响应中更新所有适用文件：
+
+| 触发条件 | 需更新的文件 |
+|---|---|
+| 文件新增 / 删除 / 重命名 | `.dutyflow_meta/PROGRAM_TREE.md` + 中文镜像 |
+| 常量新增 / 修改 | `.dutyflow_meta/PARAMS_REGISTRY.yaml` + 中文镜像 |
+| 模块状态变更 | `.dutyflow_meta/ARCHITECTURE.md` + 中文镜像 |
+| 新增或解决技术债 / 待办 | `.dutyflow_meta/TECHNICAL_DEBT_&_TODO.md` + 中文镜像 |
+| `CLAUDE.md` 任意章节变更 | `CLAUDE(中文for开发者).md` |
 
 Claude 只读英文版 `.dutyflow_meta/` 和 `CLAUDE.md`。
-中文镜像（`.dutyflow_meta（中文for开发者）/` 和 `CLAUDE(中文for开发者).md`）供人类开发者阅读——但必须保持同步。
+中文镜像供人类开发者阅读——但必须保持同步。
 
 ---
 
 ## 5. 核心编码规范
 
 ### 模块边界
-```
-poc_loader.py      ← 阶段1：脏数据进，List[TeacherRecord] 出。无求解器逻辑。
-rules.json         ← 阶段2：静态槽位/约束配置。无 Python 逻辑。
-poc_solver.py      ← 阶段3：CP-SAT 引擎。接收数据和规则。无 I/O。
-main.py            ← 仅编排器。按顺序调用阶段1→2→3。无业务逻辑。
-```
+禁止跨越以下边界——各模块的功能描述见 `ARCHITECTURE.md`：
+- `poc_loader.py` 中不得有求解器逻辑
+- `poc_solver.py` 中不得有 I/O 或数据加载逻辑
+- `main.py` 中不得有业务逻辑（仅作编排器）
+- `rules.json` 中不得有 Python 逻辑
 
 ### 数据结构
-- `TeacherRecord` 是冻结数据类。构造后字段不得修改。
-- 所有"不可用"信息（请假、不排偏好）由 `poc_loader.py` 解析为确定的
-  `Set[Tuple[int,int]]`（周索引, 天索引），在到达求解器之前完成。
+- `TeacherRecord` 是冻结数据类——构造后永远不得修改字段。
+- 字段定义和求解器输出结构见 `.dutyflow_meta/ARCHITECTURE.md`。
 
 ### 错误处理
 - `poc_loader.py`：遇到无法解析的脏单元格时，抛出带行号的 `ValueError`。
@@ -144,39 +146,20 @@ D:\SoftwareCode\MyCyberLab\GlobalCache\uv_python\cpython-3.12.13-windows-x86_64-
 
 ---
 
-## 7. 三阶段数据流（不可变）
-
-```
-[原始 Excel/CSV]
-      │
-      ▼  poc_loader.py
-[List[TeacherRecord]]  ←→  [rules.json]
-      │
-      ▼  poc_solver.py（CP-SAT）
-[排班矩阵：教师 × 天 × 槽位]
-      │
-      ▼  main.py / Streamlit
-[输出：终端表格 / HTML 渲染]
-```
-
-此流程是线性单向单遍的。运行时各阶段之间没有反馈回路。
-
----
-
-## 8. Plan 模式规则
+## 7. Plan 模式规则
 
 在 **Plan 模式**下（即在编写代码前设计方案时）：
 
-### 8.1 输出必须极其简约
+### 7.1 输出必须极其简约
 - 只说明：要改什么、影响哪些文件、为什么。
 - 使用项目符号或简短的编号列表。不写段落。
 - 计划输出中不包含代码块、diff、行内代码片段。
 
-### 8.2 计划输出中禁止出现代码
+### 7.2 计划输出中禁止出现代码
 - 规划阶段绝不输出实际代码、函数体或逐行修改内容。
 - 如果某个 API 签名对计划至关重要，只提及函数名——不写实现。
 
-### 8.3 计划格式（必须遵守）
+### 7.3 计划格式（必须遵守）
 ```
 涉及文件：<逗号分隔列表>
 变更内容：
@@ -186,6 +169,6 @@ D:\SoftwareCode\MyCyberLab\GlobalCache\uv_python\cpython-3.12.13-windows-x86_64-
 风险 / 阻塞项：<一句话，或"无">
 ```
 
-### 8.4 执行前确认
+### 7.4 执行前确认
 - 提交计划后，等待用户明确批准，再编写任何代码。
 - 用户说"go" / "ok" / "好" / "开始"等，立即进入实现，不要重新总结计划。

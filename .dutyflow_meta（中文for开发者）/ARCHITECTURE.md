@@ -1,7 +1,7 @@
 # DutyFlow（降级版）— 系统架构文档
 
 > 阅读对象：人类开发者（中文版）。AI 只读英文版 `.dutyflow_meta/ARCHITECTURE.md`。
-> 最后更新：2026-04-06
+> 最后更新：2026-04-06（新增 clean_schedule.py；更新 TeacherRecord 以匹配真实数据结构）
 
 ---
 
@@ -52,6 +52,7 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 
 | 模块 | 文件 | 状态 | 说明 |
 |---|---|---|---|
+| **数据清洗器** | `clean_schedule.py` | **已完成** | 独立离线脚本；标准化 晚自修排版.xlsx 并计算历史值班统计 |
 | 数据加载器 | `poc_loader.py` | 未创建 | Pandas 解析脏数据，输出 `List[TeacherRecord]` |
 | 规则配置 | `rules.json` | 未创建 | 静态槽位/约束 JSON，学校特定硬编码 |
 | CP-SAT 求解器 | `poc_solver.py` | 未创建 | OR-Tools 引擎，纯布尔约束代数，无 I/O |
@@ -63,23 +64,89 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 
 ## 核心数据结构
 
-### TeacherRecord（冻结数据类）
+### 次数 Sheet 字段（晚自修排版.xlsx 中的真实列）
+
+| 列 | 字段 | 说明 |
+|---|---|---|
+| A | 序号 | 整数 ID，1–N |
+| B | 姓名 | 教师显示名称 |
+| C | 教学学科 | 科目（语文/数学/英语/…） |
+| D | 教学年级 | 年级（高一/高二/…） |
+| E | 要求 | 约束标签：`不排了` / `不要周日` / `不要周五`（多个用中文逗号分隔） |
+| F | 楼层 | 标准化楼层：`1楼` / `2-3楼` / `4-5楼` |
+
+### 清洗后数据 Sheet 字段（由 clean_schedule.py 生成）
+
+| 列 | 字段 | 说明 |
+|---|---|---|
+| A | 序号 | 镜像 次数.序号 |
+| B | 姓名 | 镜像 次数.姓名 |
+| C | 教学学科 | 镜像 次数.教学学科 |
+| D | 教学年级 | 镜像 次数.教学年级 |
+| E | 要求 | 镜像 次数.要求 |
+| F | 楼层 | 镜像 次数.楼层（已标准化） |
+| G | 是否班主任 | `是` / `否`，来自 clean_schedule.py 中的 BANZHUREN 集合 |
+| H | 历史总次数 | 所有月份sheet中出现的总次数之和 |
+| I | 历史周五次数 | H 中星期=五的子集 |
+| J | 历史周日次数 | H 中星期=日的子集 |
+| K | 月均次数/N月 | H ÷ 有数据的月份数 |
+| L | 月均周五/N月 | I ÷ 同分母 |
+| M | 月均周日/N月 | J ÷ 同分母 |
+
+### TeacherRecord（冻结数据类，供 poc_loader.py 使用，尚未实现）
 ```python
 @dataclass(frozen=True)
 class TeacherRecord:
-    teacher_id: str           # 唯一标识符（来自 Excel 行键）
-    name: str                 # 显示名称
-    unavailable: frozenset    # frozenset[tuple[int, int]] — (周索引, 天索引), 0起
-    max_duties_per_week: int  # 从 PARAMS_REGISTRY 加载，可按教师个性化
-    notes: str                # 原始备注字符串，保留用于审计追踪
+    teacher_id: int           # 次数 sheet 中的序号
+    name: str                 # 姓名
+    subject: str              # 教学学科
+    grade: str                # 教学年级
+    floor_zone: str           # 楼层（标准化后："1楼" | "2-3楼" | "4-5楼"）
+    tags: frozenset[str]      # 要求标签集合：{"不排了"} | {"不要周日"} | {"不要周五"} | {}
+    is_banzhuren: bool        # 是否为班主任
+    history_total: int        # 历史总次数（来自清洗后数据）
+    history_friday: int       # 历史周五次数
+    history_sunday: int       # 历史周日次数
 ```
 
-### 求解器输出
+### 求解器输出（规划中）
 ```python
 # 布尔赋值矩阵
 assignments: dict[str, list[list[list[bool]]]]
 # assignments[teacher_id][week][day][slot] = True/False
 ```
+
+---
+
+## clean_schedule.py 数据清洗流程
+
+独立脚本，不被任何运行时模块导入。
+
+```
+晚自修排版.xlsx（原始）
+        │
+        ▼
+  patch_cishu_sheet()
+  ├── 标准化楼层列（2/3楼→2-3楼；4/5楼→4-5楼）
+  ├── 清除要求列中残留的"班主任"标签（如有）
+  └── 补录/更新5位缺失老师（仅填充空字段，不覆盖）
+        │
+        ▼
+  collect_duty_counts()
+  ├── 自动检测所有非元数据sheet为月份排班表
+  ├── 兼容"三"和"星期三"两种星期格式
+  ├── "全体班主任"→ 给所有 BANZHUREN 成员 +1
+  └── 返回：每位老师的总次数/周五次数/周日次数
+        │
+        ▼
+  build_clean_sheet()
+  └── 写入"清洗后数据"sheet（每次运行先删后建）
+        │
+        ▼
+  晚自修排版.xlsx（已清洗 + 含统计）
+```
+
+**重跑时机**：每次向 Excel 新增月份sheet后。
 
 ---
 
