@@ -1,0 +1,141 @@
+# PARAMS_REGISTRY.yaml — DutyFlow (Degradation) Parameter Registry
+#
+# USAGE RULES (enforced by CLAUDE.md Golden Rule 4.1):
+#   - Every numeric constant used in any source file MUST be defined here first.
+#   - Source files load this file at module init (e.g., via PyYAML).
+#   - Never hardcode a numeric value inline without a corresponding entry here.
+#   - Comments explain the business rationale, not just the value.
+#
+# Last updated: 2026-04-06
+
+# ──────────────────────────────────────────────────────
+# Section 1: Schedule Scope
+# ──────────────────────────────────────────────────────
+schedule:
+  # Number of weeks in one scheduling cycle
+  # Typically one full month ≈ 4-5 weeks; start with 4 for PoC
+  num_weeks: 4
+
+  # Days per week that require duty coverage
+  # 5 = Monday–Friday only (school is closed on weekends)
+  working_days_per_week: 5
+
+  # Day index of Sunday within a 7-day week (0=Mon … 6=Sun)
+  # Used when parsing "不要周日" (no-Sunday) preference strings
+  sunday_day_index: 6
+
+# ──────────────────────────────────────────────────────
+# Section 2: Slot Definitions
+# ──────────────────────────────────────────────────────
+slots:
+  # Each slot represents one floor-zone duty post per day
+  # slot_id must match keys in rules.json → slots
+  floor_1:
+    display_name: "1st Floor"
+    required_headcount: 1       # Exactly 1 teacher must cover this slot each active day
+
+  floor_2_3:
+    display_name: "2nd–3rd Floor"
+    required_headcount: 1
+
+  floor_4_5:
+    display_name: "4th–5th Floor"
+    required_headcount: 1
+
+# ──────────────────────────────────────────────────────
+# Section 3: Duty Load Constraints
+# ──────────────────────────────────────────────────────
+duty_load:
+  # Minimum total duty slots a teacher must be assigned over the full schedule period
+  # Set to 0 during PoC to avoid forcing assignments on teachers with many leave days
+  min_duties_total: 0
+
+  # Maximum total duty slots a teacher can be assigned over the full schedule period
+  # 3 slots/day × 20 working days / N teachers — tune after knowing actual teacher count
+  # Default: 8 (roughly 2 duties/week for a team of ~10)
+  max_duties_total: 8
+
+  # Maximum duties a teacher can be assigned in a single week
+  # Prevents weekly overload even if monthly total is within bounds
+  max_duties_per_week: 3
+
+  # Maximum consecutive working days a teacher can be assigned duty
+  # Prevents streaks like Mon-Tue-Wed all assigned to same person
+  max_consecutive_duty_days: 2
+
+# ──────────────────────────────────────────────────────
+# Section 4: Solver Configuration (CP-SAT)
+# ──────────────────────────────────────────────────────
+solver:
+  # Wall-clock time limit for CP-SAT search (seconds)
+  # Increase if schedule is infeasible and you suspect it needs more search time
+  time_limit_seconds: 30
+
+  # Number of parallel search workers for CP-SAT
+  # Set to 1 for fully deterministic output (no parallel search randomness)
+  num_search_workers: 1
+
+  # Random seed for CP-SAT (only relevant if num_search_workers > 1)
+  # Keep fixed for reproducibility
+  random_seed: 42
+
+  # Log search progress to stdout during solving
+  # Set to false in production/Streamlit mode to avoid cluttering output
+  log_search_progress: true
+
+# ──────────────────────────────────────────────────────
+# Section 5: Data Loading & Cleaning
+# ──────────────────────────────────────────────────────
+data_loader:
+  # Expected sheet name in the input Excel file
+  # If the file has only one sheet, this is ignored and first sheet is used
+  excel_sheet_name: "排班"
+
+  # Column name in the Excel file that contains the teacher's name
+  teacher_name_column: "姓名"
+
+  # Column name containing availability/leave notes (dirty free-text)
+  notes_column: "备注"
+
+  # Strings that, when found in the notes column, mean "completely unavailable this period"
+  # Case-insensitive matching; strip whitespace before comparison
+  full_unavailability_keywords:
+    - "不排"
+    - "请假"
+    - "病假"
+    - "事假"
+    - "产假"
+    - "离职"
+
+  # Strings that mean "unavailable on Sundays" (day_index=6)
+  sunday_unavailability_keywords:
+    - "不要周日"
+    - "不排周日"
+    - "周日不排"
+
+  # If a cell value matches any of these, treat it as "no constraint" (fully available)
+  null_availability_keywords:
+    - ""
+    - "无"
+    - "/"
+    - "-"
+    - "—"
+
+# ──────────────────────────────────────────────────────
+# Section 6: Output Formatting
+# ──────────────────────────────────────────────────────
+output:
+  # Column width for terminal pretty-print (characters)
+  terminal_column_width: 12
+
+  # Date format string for schedule header row
+  date_format: "%Y-%m-%d"
+
+  # Placeholder string when a slot is unassigned (should not happen if solver succeeds)
+  unassigned_placeholder: "???"
+
+  # Display string for a teacher's assigned duty slot
+  assigned_marker: "●"
+
+  # Display string for a teacher's day off / unassigned
+  off_marker: "·"

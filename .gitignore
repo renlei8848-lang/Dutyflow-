@@ -1,0 +1,26 @@
+# 环境变量与密钥（绝对禁止上传）
+.env
+*.key
+*.pem
+
+# Python 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 数据文件（体积大）
+data/
+*.parquet
+*.csv
+*.h5
+
+# 模型权重（超过 GitHub 100MB 单文件限制）
+*.pth
+*.safetensors
+*.onnx
+*.bin
+
+# 日志
+*.log
+logs/
