@@ -21,6 +21,7 @@ BANZHUREN = {
     "胡晓娴", "丁亚男", "蒋寅", "许仲", "叶云", "吴徐帆",
     "陆子辰", "陆梦霞", "王仕全", "金丹萍", "毛建伟", "蓝申剑",
     "熊颖", "钟靖", "杨朋昊",
+    "肖中海",
 }
 
 # 在月份排班表中出现但"次数"名单中缺失的老师（含已知元数据）
@@ -33,7 +34,7 @@ MISSING_TEACHERS = [
 ]
 
 # 月份sheet由运行时动态检测（排除固定sheet），无需手动维护
-EXCLUDE_SHEETS = {"次数", "清洗后数据"}
+EXCLUDE_SHEETS = {"次数", "清洗后数据", "test"}
 
 FLOOR_MAP = {
     "2楼": "2-3楼",
@@ -225,9 +226,16 @@ def build_clean_sheet(
     sunday_count: dict,
     active_months: int,
 ):
-    # 删除旧的（如果有）
+    # 先把现有"清洗后数据"的 A-F 列读出来缓存（保留人工编辑内容）
+    # 键：姓名；值：(xueke, nianji, yaoqiu, floor) — 序号重新按顺序编
+    preserved_af: dict[str, tuple] = {}
     if "清洗后数据" in wb.sheetnames:
+        for row in wb["清洗后数据"].iter_rows(min_row=2, values_only=True):
+            if row[1]:  # 姓名不为空
+                name = str(row[1]).strip()
+                preserved_af[name] = (row[2], row[3], row[4], row[5], row[6])  # 学科,年级,要求,楼层,是否班主任
         del wb["清洗后数据"]
+        print(f"  已读取 {len(preserved_af)} 条 A-G 列缓存（人工编辑内容将被保留）。")
 
     # 插入在"次数"之后
     cishu_idx = wb.sheetnames.index(wb.sheetnames[0])
@@ -247,11 +255,17 @@ def build_clean_sheet(
         if not name:
             continue
         name = str(name).strip()
-        xueke  = row[2]
-        nianji = row[3]
-        yaoqiu = row[4]
-        floor  = row[5]
-        is_bzr = "是" if name in BANZHUREN else "否"
+
+        if name in preserved_af:
+            # 优先使用"清洗后数据"中保留的 A-G 值（人工编辑内容）
+            xueke, nianji, yaoqiu, floor, is_bzr = preserved_af[name]
+        else:
+            # 新增老师：从"次数"sheet 读取，是否班主任由 BANZHUREN 集合决定
+            xueke  = row[2]
+            nianji = row[3]
+            yaoqiu = row[4]
+            floor  = row[5]
+            is_bzr = "是" if name in BANZHUREN else "否"
 
         total   = total_count.get(name, 0)
         friday  = friday_count.get(name, 0)

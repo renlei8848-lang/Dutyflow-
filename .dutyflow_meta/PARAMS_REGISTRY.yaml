@@ -68,8 +68,9 @@ duty_load:
 # ──────────────────────────────────────────────────────
 solver:
   # Wall-clock time limit for CP-SAT search (seconds)
-  # Increase if schedule is infeasible and you suspect it needs more search time
-  time_limit_seconds: 30
+  # Increased from 30 to 60 after adding HC-6 range constraints and spacing/deviation
+  # soft terms, which significantly grow the search space.
+  time_limit_seconds: 180
 
   # Number of parallel search workers for CP-SAT
   # Set to 1 for fully deterministic output (no parallel search randomness)
@@ -98,6 +99,7 @@ data_loader:
   exclude_sheets:
     - "次数"
     - "清洗后数据"
+    - "test"
 
   # Column name in the Excel file that contains the teacher's name
   teacher_name_column: "姓名"
@@ -158,9 +160,10 @@ clean_schedule:
   # Special cell value triggering a count increment for all 班主任 teachers
   banzhuren_trigger_string: "全体班主任"
 
-  # 班主任 list (15 people as of 2026-04-06); maintained in clean_schedule.py BANZHUREN set
+  # 班主任 list (16 people as of 2026-04-06); maintained in clean_schedule.py BANZHUREN set
   # 朱林锋 excluded — not found in roster (treated as 不排)
-  banzhuren_count: 15
+  # 肖中海 added 2026-04-06
+  banzhuren_count: 16
 
   # Teachers added to roster from schedule data (missing from original 次数 sheet)
   supplemental_teacher_count: 5
@@ -183,3 +186,62 @@ output:
 
   # Display string for a teacher's day off / unassigned
   off_marker: "·"
+
+  # Sheet name written by poc_solver.export_to_excel()
+  # Must also appear in data_loader.exclude_sheets to avoid being counted as historical data
+  output_sheet_name: "test"
+
+# ──────────────────────────────────────────────────────
+# Section 7: Soft Constraint Weights (软约束权重/得分)
+# 用于 CP-SAT 目标函数 (Maximize Objective)
+# ──────────────────────────────────────────────────────
+weights:
+  # 学科与日期偏好得分 (正向激励)
+  pref_banzhuren_weekend: 100   # 班主任排在周五/周日
+  pref_english_mon_thu: 50      # 英语排在周一/周四
+  pref_chinese_tue: 50          # 语文排在周二
+  pref_politics_wed: 50         # 政治排在周三
+
+  # 间隔与分配偏好 (正向激励)
+  pref_spacing_gap: 30          # 两次值班间隔拉开(>=7天)的加分
+  pref_non_banzhuren_double: 40 # 必须单月排2次时，优先分配给非班主任的加分
+
+  # 均衡惩罚 (负向扣分，越不平衡扣分越多)
+  # NOTE: penalty_variance is registered but not used in the objective — the 极差 range is
+  # already enforced as a hard constraint (HC-6) so a soft penalty would be redundant.
+  penalty_variance: -100        # (unused — see HC-6 range constraints)
+  penalty_avg_deviation: -80    # 偏离"月均目标"的惩罚基数 (如班主任月均目标为1)
+
+  # SC-4: 班主任出现在周一到周四的惩罚
+  # 使净得分 = -200 + max(subject_pref=50) + max(spacing=30) ≈ -120 → 求解器主动回避
+  penalty_bz_non_weekend: -200
+
+  # SC-5: 非班主任"本月已排周五/日 + 还排第二次"的惩罚
+  # 触发条件: fri_new + sun_new == 1 AND total_new == 2
+  # 第二次值班的最大收益 = deviation改善(80) + pref_non_bz_double(40) = 120
+  # -150 使净值 = -30 → 求解器优先让无周末值班的老师承担第二次
+  penalty_non_bz_weekend_double: -150
+
+# ──────────────────────────────────────────────────────
+# Section 8: Monthly Target & Range Constraint Parameters
+# ──────────────────────────────────────────────────────
+monthly_targets:
+  # Expected number of new duty assignments for 班主任 teachers in one scheduling cycle
+  banzhuren_target: 1
+
+  # Expected number of new duty assignments for non-班主任 teachers in one scheduling cycle
+  non_banzhuren_target: 2
+
+  # Hard upper bound on (max − min) projected duty counts within each teacher group.
+  # Applied to total / friday / sunday projected counts for BZ and non-BZ groups separately.
+  # "Projected" = historical count + new assignments from the current solve.
+  max_projected_range: 1
+
+# ──────────────────────────────────────────────────────
+# Section 9: Soft Constraint Thresholds
+# ──────────────────────────────────────────────────────
+soft_constraints:
+  # Minimum number of weeks between two assignments for the same teacher.
+  # Used by the pref_spacing_gap objective term — pairs (w1, w2) with w2-w1 >= this
+  # value receive the spacing bonus.
+  min_week_gap: 2

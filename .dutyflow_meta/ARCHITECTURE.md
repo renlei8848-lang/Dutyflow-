@@ -1,7 +1,7 @@
 # DutyFlow (Degradation) — System Architecture
 
 > Audience: Claude Code (AI). For human-readable Chinese version, see `.dutyflow_meta（中文for开发者）/ARCHITECTURE.md`.
-> Last updated: 2026-04-06 (clean_schedule.py added; TeacherRecord updated to match real data)
+> Last updated: 2026-04-07 (SC-4 penalty_bz_non_weekend + SC-5 penalty_non_bz_weekend_double added; time limit 180 s; rule micro-adjustments synced)
 
 ---
 
@@ -22,17 +22,17 @@ not to build a reusable framework.
 │                                                                       │
 │  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
 │  │ Phase 1      │    │ Phase 2      │    │ Phase 3               │  │
-│  │ poc_loader   │───▶│ rules.json   │───▶│ poc_solver            │  │
-│  │              │    │              │    │                       │  │
-│  │ Dirty Excel  │    │ Slot defs:   │    │ CP-SAT model:         │  │
-│  │ /CSV input   │    │ - Floor 1    │    │ - Coverage constraint │  │
-│  │     │        │    │ - Floor 2-3  │    │ - No-clone constraint │  │
-│  │     ▼        │    │ - Floor 4-5  │    │ - Leave enforcement   │  │
-│  │ TeacherRecord│    │              │    │ - Load balancing      │  │
-│  │ dataclass    │    │ Constraints: │    │                       │  │
-│  │ List[...]    │    │ - Leave days │    │ Output: bool matrix   │  │
-│  │              │    │ - Day-off    │    │ teacher × day × slot  │  │
-│  └──────────────┘    │   prefs      │    └───────────────────────┘  │
+│  │ poc_loader   │───▶│ PARAMS_      │───▶│ poc_solver            │  │
+│  │              │    │ REGISTRY     │    │                       │  │
+│  │ Dirty Excel  │    │ .yaml        │    │ CP-SAT model:         │  │
+│  │ /CSV input   │    │              │    │ - Coverage constraint │  │
+│  │     │        │    │ Slot defs:   │    │ - No-clone constraint │  │
+│  │     ▼        │    │ - Floor 1    │    │ - Leave enforcement   │  │
+│  │ TeacherRecord│    │ - Floor 2-3  │    │ - Load balancing      │  │
+│  │ dataclass    │    │ - Floor 4-5  │    │                       │  │
+│  │ List[...]    │    │              │    │ Output: bool matrix   │  │
+│  │              │    │ Weights:     │    │ teacher × day × slot  │  │
+│  └──────────────┘    │ soft scores  │    └───────────────────────┘  │
 │                       └──────────────┘               │               │
 │                                                       ▼               │
 │                                            ┌──────────────────────┐  │
@@ -49,10 +49,10 @@ not to build a reusable framework.
 
 | Module | File | Status | Description |
 |---|---|---|---|
-| **Data Cleaner** | `clean_schedule.py` | **COMPLETE** | Standalone offline script; normalizes 晚自修排版.xlsx and computes historical duty stats |
-| Data Loader | `poc_loader.py` | NOT CREATED | Pandas-based dirty-data parser; outputs `List[TeacherRecord]` |
-| Rule Config | `rules.json` | NOT CREATED | Static slot/constraint JSON; school-specific hardcoded values |
-| CP-SAT Solver | `poc_solver.py` | NOT CREATED | OR-Tools CP-SAT engine; pure constraint algebra, no I/O |
+| **Data Cleaner** | `clean_schedule.py` | **COMPLETE** | Standalone offline script; normalizes 晚自修排版.xlsx and computes historical duty stats. On re-run, preserves manually-edited A-G columns in "清洗后数据"; only recalculates H-M stats. BANZHUREN set: 16 members (肖中海 added 2026-04-06). EXCLUDE_SHEETS includes "test". |
+| Data Loader | `poc_loader.py` | **COMPLETE** | Pandas-based dirty-data parser; outputs `List[TeacherRecord]`; verified 50 records, safety floor-tag interception |
+| Rule Config | `PARAMS_REGISTRY.yaml` | **COMPLETE** | All slot definitions, hard constraints, and soft-constraint weights; sections 8 (monthly_targets) and 9 (soft_constraints) added; `rules.json` formally retired |
+| CP-SAT Solver | `poc_solver.py` | **COMPLETE** | OR-Tools CP-SAT engine; DutySolver class; 6 hard constraints (HC-1–HC-6); 6 soft objective terms (SC-1–SC-5 + subject/day prefs); writes to "test" sheet; solver time limit 180 s. Debug methods: `verify_solution()` (post-solve HC checker), `print_solution_summary()` (per-teacher counts + schedule table → `debug_solver_run.txt`). |
 | Orchestrator | `main.py` | STUB (uv-generated) | Linear call chain Phase 1→2→3; needs implementation |
 | UI Layer | `streamlit_app.py` | NOT CREATED | Optional Streamlit result viewer; blocked on solver working first |
 | Tests | `tests/` | NOT CREATED | Unit tests for loader clean functions and solver constraints |
@@ -82,7 +82,7 @@ not to build a reusable framework.
 | D | 教学年级 | Mirrors 次数.教学年级 |
 | E | 要求 | Mirrors 次数.要求 |
 | F | 楼层 | Mirrors 次数.楼层 (normalized) |
-| G | 是否班主任 | `是` / `否` — derived from hardcoded BANZHUREN set in clean_schedule.py |
+| G | 是否班主任 | `是` / `否` — preserved from existing sheet on re-run; set from BANZHUREN for new teachers |
 | H | 历史总次数 | Sum of all duty appearances across all monthly sheets |
 | I | 历史周五次数 | Subset of H where 星期=五 |
 | J | 历史周日次数 | Subset of H where 星期=日 |
@@ -90,20 +90,22 @@ not to build a reusable framework.
 | L | 月均周五/N月 | I ÷ same denominator |
 | M | 月均周日/N月 | J ÷ same denominator |
 
-### TeacherRecord (frozen dataclass — planned for poc_loader.py)
+### TeacherRecord (frozen dataclass — defined in poc_loader.py)
 ```python
 @dataclass(frozen=True)
 class TeacherRecord:
     teacher_id: int           # 序号 from 次数 sheet
     name: str                 # 姓名
     subject: str              # 教学学科
-    grade: str                # 教学年级
-    floor_zone: str           # 楼层 (normalized: "1楼" | "2-3楼" | "4-5楼")
+    floor_zone: str           # 楼层 (normalized: "1楼" | "2-3楼" | "4-5楼"); empty → "不排了" auto-injected
     tags: frozenset[str]      # 要求 tags: {"不排了"} | {"不要周日"} | {"不要周五"} | {}
     is_banzhuren: bool        # True if in BANZHUREN set
     history_total: int        # 历史总次数 (from 清洗后数据)
     history_friday: int       # 历史周五次数
     history_sunday: int       # 历史周日次数
+    avg_total: float          # 月均次数/N月 (column name is dynamic; fuzzy-matched by loader)
+    avg_friday: float         # 月均周五/N月
+    avg_sunday: float         # 月均周日/N月
 ```
 
 ### Solver Output
@@ -115,7 +117,7 @@ assignments: dict[str, list[list[list[bool]]]]
 
 ---
 
-## Slot Definitions (School-Specific, Hardcoded in rules.json)
+## Slot Definitions (School-Specific, defined in PARAMS_REGISTRY.yaml → slots)
 
 Each school day requires coverage on 3 floor zones:
 
@@ -125,18 +127,32 @@ Each school day requires coverage on 3 floor zones:
 | `floor_2_3` | 2nd–3rd Floor | 1 person |
 | `floor_4_5` | 4th–5th Floor | 1 person |
 
-> These values must match `rules.json → slots`. Any discrepancy between this table and rules.json
-> means rules.json is the authoritative source.
+> Authoritative source: `PARAMS_REGISTRY.yaml → slots`. `rules.json` is formally retired and does not exist.
 
 ---
 
 ## CP-SAT Constraint Hierarchy
 
-1. **Hard — Coverage**: Every slot every active day must have exactly the required headcount.
-2. **Hard — No-clone**: A teacher can be assigned to at most 1 slot per day.
-3. **Hard — Leave enforcement**: `unavailable` days are absolutely blocked (BoolVar forced to 0).
-4. **Soft → Hard — Load balancing**: Total duty count per teacher over the schedule period
-   must stay within `[min_duties_total, max_duties_total]` from PARAMS_REGISTRY.
+### Hard constraints
+1. **HC-1 — Coverage**: Every slot every active day must have exactly the required headcount.
+2. **HC-2 — No-clone**: A teacher can be assigned to at most 1 slot per day.
+3. **HC-3 — Weekly cap**: At most 1 duty per teacher per week.
+4. **HC-4 — Monthly cap**: At most 1 duty if tagged "一个月只能1次", else at most 2.
+5. **HC-5 — Weekend mutex**: `sum(friday_assignments) + sum(sunday_assignments) ≤ 1` per teacher.
+6. **HC-6 — 极差 (range) constraints**: Within each teacher group {BZ, non-BZ}, the range
+   `max(new_count) − min(new_count) ≤ max_projected_range` (= 1) for total / friday / sunday
+   new assignment counts.  Groups with ≤1 active member are skipped.
+
+### Soft objective (Maximize)
+- `pref_banzhuren_weekend` (100): BZ teacher assigned on Fri/Sun.
+- `pref_english_mon_thu` (50): English teacher on Mon/Thu.
+- `pref_chinese_tue` (50): Chinese teacher on Tue.
+- `pref_politics_wed` (50): Politics teacher on Wed.
+- **SC-1** `pref_non_banzhuren_double` (40): non-BZ teacher new assignments × weight (encourages filling 2-slot quota with non-BZ first).
+- **SC-2** `pref_spacing_gap` (30): reward when a teacher's two assignments are ≥ `min_week_gap` weeks apart.
+- **SC-3** `penalty_avg_deviation` (−80): penalizes `|new_count − monthly_target|` per teacher.
+- **SC-4** `penalty_bz_non_weekend` (−200): penalizes BZ teacher assigned on Mon–Thu. Net score even with subject pref (+50) and spacing (+30) is negative; solver avoids weekday BZ assignments.
+- **SC-5** `penalty_non_bz_weekend_double` (−150): penalizes non-BZ teacher who has ≥1 Fri/Sun assignment AND ≥2 total assignments this cycle. Discourages giving a non-BZ teacher a 2nd duty after they already have a Fri/Sun duty.
 
 ---
 
@@ -162,7 +178,10 @@ Standalone script. Not imported by any runtime module.
         │
         ▼
   build_clean_sheet()
-  └── Write "清洗后数据" sheet (delete & recreate each run)
+  ├── Read existing "清洗后数据" A-G columns into cache (preserves manual edits)
+  ├── Delete old sheet, recreate
+  ├── For each teacher: use cached A-G if exists, else read from "次数"
+  └── Always recalculate H-M (stats) from duty counts
         │
         ▼
   晚自修排版.xlsx (cleaned + stats)

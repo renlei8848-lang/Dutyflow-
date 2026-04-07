@@ -1,7 +1,7 @@
 # DutyFlow（降级版）— 系统架构文档
 
 > 阅读对象：人类开发者（中文版）。AI 只读英文版 `.dutyflow_meta/ARCHITECTURE.md`。
-> 最后更新：2026-04-06（新增 clean_schedule.py；更新 TeacherRecord 以匹配真实数据结构）
+> 最后更新：2026-04-06（核心求解器重构：新增 HC-6 极差约束、软约束项全部实现、输出改为"test"sheet；clean_schedule.py 新增 A-G 列保留逻辑）
 
 ---
 
@@ -13,7 +13,7 @@
 OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 
 - **不用黑盒**：运行时绝不调用大模型，Claude 仅在离线数据清洗和代码生成时使用。
-- **不做抽象**：所有约束硬编码或写入 `rules.json`，不做动态规则解析。
+- **不做抽象**：所有约束硬编码或写入 `PARAMS_REGISTRY.yaml`，不做动态规则解析。
 - **必须可复现**：相同输入必须产生完全相同的排班结果，零随机性。
 
 ---
@@ -26,16 +26,16 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 │                                                              │
 │  ┌──────────────┐   ┌──────────────┐   ┌────────────────┐  │
 │  │ 阶段 1       │   │ 阶段 2       │   │ 阶段 3         │  │
-│  │ poc_loader   │──▶│ rules.json   │──▶│ poc_solver     │  │
-│  │              │   │              │   │                │  │
-│  │ 脏 Excel/CSV │   │ 槽位定义：   │   │ CP-SAT 模型：  │  │
-│  │ 输入文件     │   │ · 1楼        │   │ · 覆盖约束     │  │
-│  │     │        │   │ · 2-3楼      │   │ · 无分身约束   │  │
-│  │     ▼        │   │ · 4-5楼      │   │ · 请假强制     │  │
-│  │ TeacherRecord│   │              │   │ · 负载均衡     │  │
-│  │ 数据类列表   │   │ 约束定义：   │   │               │  │
-│  │              │   │ · 请假日期   │   │ 输出：布尔矩阵  │  │
-│  └──────────────┘   │ · 不排偏好   │   │ 教师×天×槽位   │  │
+│  │ poc_loader   │──▶│ PARAMS_      │──▶│ poc_solver     │  │
+│  │              │   │ REGISTRY     │   │                │  │
+│  │ 脏 Excel/CSV │   │ .yaml        │   │ CP-SAT 模型：  │  │
+│  │ 输入文件     │   │              │   │ · 覆盖约束     │  │
+│  │     │        │   │ 槽位定义：   │   │ · 无分身约束   │  │
+│  │     ▼        │   │ · 1楼        │   │ · 请假强制     │  │
+│  │ TeacherRecord│   │ · 2-3楼      │   │ · 负载均衡     │  │
+│  │ 数据类列表   │   │ · 4-5楼      │   │               │  │
+│  │              │   │              │   │ 输出：布尔矩阵  │  │
+│  └──────────────┘   │ 软约束权重   │   │ 教师×天×槽位   │  │
 │                      └──────────────┘   └────────────────┘  │
 │                                                  │            │
 │                                                  ▼            │
@@ -52,10 +52,10 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 
 | 模块 | 文件 | 状态 | 说明 |
 |---|---|---|---|
-| **数据清洗器** | `clean_schedule.py` | **已完成** | 独立离线脚本；标准化 晚自修排版.xlsx 并计算历史值班统计 |
-| 数据加载器 | `poc_loader.py` | 未创建 | Pandas 解析脏数据，输出 `List[TeacherRecord]` |
-| 规则配置 | `rules.json` | 未创建 | 静态槽位/约束 JSON，学校特定硬编码 |
-| CP-SAT 求解器 | `poc_solver.py` | 未创建 | OR-Tools 引擎，纯布尔约束代数，无 I/O |
+| **数据清洗器** | `clean_schedule.py` | **已完成** | 独立离线脚本；标准化 晚自修排版.xlsx 并计算历史值班统计。重跑时保留"清洗后数据"A-G列（人工编辑不丢失），仅重算H-M统计列。BANZHUREN：16人（肖中海已加入）；EXCLUDE_SHEETS 含"test"。 |
+| 数据加载器 | `poc_loader.py` | **已完成** | Pandas 解析脏数据，输出 `List[TeacherRecord]`；验证50条记录，楼层安全拦截正常 |
+| 规则配置 | `PARAMS_REGISTRY.yaml` | **已完成** | 所有槽位定义、硬约束与软约束权重；新增第8节（月均目标）和第9节（软约束阈值）；`rules.json` 正式废弃 |
+| CP-SAT 求解器 | `poc_solver.py` | **已完成** | OR-Tools CP-SAT 引擎；DutySolver 类；6个硬约束（HC-1~HC-6）；6类软目标项（SC-1~SC-5 + 学科/日期偏好）；结果写入"test"sheet；时间限制180秒。调试方法：`verify_solution()`（逐条验证HC-1~HC-6）、`print_solution_summary()`（分组次数统计+排班明细，写入 `debug_solver_run.txt`）。 |
 | 编排器 | `main.py` | 存根（uv 生成） | 线性调用 阶段1→2→3，待实现 |
 | UI 层 | `streamlit_app.py` | 未创建 | 可选 Streamlit 结果查看器，阻塞于求解器先通过 |
 | 测试 | `tests/` | 未创建 | 加载器和求解器的单元测试 |
@@ -85,7 +85,7 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 | D | 教学年级 | 镜像 次数.教学年级 |
 | E | 要求 | 镜像 次数.要求 |
 | F | 楼层 | 镜像 次数.楼层（已标准化） |
-| G | 是否班主任 | `是` / `否`，来自 clean_schedule.py 中的 BANZHUREN 集合 |
+| G | 是否班主任 | `是` / `否`，重跑时从现有sheet保留；新增老师由 BANZHUREN 集合决定 |
 | H | 历史总次数 | 所有月份sheet中出现的总次数之和 |
 | I | 历史周五次数 | H 中星期=五的子集 |
 | J | 历史周日次数 | H 中星期=日的子集 |
@@ -93,20 +93,22 @@ OR-Tools CP-SAT 能正确解决某所学校的排班约束问题。
 | L | 月均周五/N月 | I ÷ 同分母 |
 | M | 月均周日/N月 | J ÷ 同分母 |
 
-### TeacherRecord（冻结数据类，供 poc_loader.py 使用，尚未实现）
+### TeacherRecord（冻结数据类，定义于 poc_loader.py）
 ```python
 @dataclass(frozen=True)
 class TeacherRecord:
     teacher_id: int           # 次数 sheet 中的序号
     name: str                 # 姓名
     subject: str              # 教学学科
-    grade: str                # 教学年级
-    floor_zone: str           # 楼层（标准化后："1楼" | "2-3楼" | "4-5楼"）
+    floor_zone: str           # 楼层（标准化后："1楼" | "2-3楼" | "4-5楼"）；为空时自动注入"不排了"
     tags: frozenset[str]      # 要求标签集合：{"不排了"} | {"不要周日"} | {"不要周五"} | {}
     is_banzhuren: bool        # 是否为班主任
     history_total: int        # 历史总次数（来自清洗后数据）
     history_friday: int       # 历史周五次数
     history_sunday: int       # 历史周日次数
+    avg_total: float          # 月均次数/N月（列名含动态月份后缀，由加载器模糊匹配）
+    avg_friday: float         # 月均周五/N月
+    avg_sunday: float         # 月均周日/N月
 ```
 
 ### 求解器输出（规划中）
@@ -140,7 +142,10 @@ assignments: dict[str, list[list[list[bool]]]]
         │
         ▼
   build_clean_sheet()
-  └── 写入"清洗后数据"sheet（每次运行先删后建）
+  ├── 读取现有"清洗后数据"A-G列缓存（保留人工编辑）
+  ├── 删除旧sheet、重建
+  ├── 各老师：有缓存→用缓存值；无缓存（新增）→从"次数"读取
+  └── 始终重新计算 H-M（统计数据）
         │
         ▼
   晚自修排版.xlsx（已清洗 + 含统计）
@@ -150,7 +155,7 @@ assignments: dict[str, list[list[list[bool]]]]
 
 ---
 
-## 槽位定义（学校特定，硬编码于 rules.json）
+## 槽位定义（学校特定，定义于 PARAMS_REGISTRY.yaml → slots）
 
 每个学校工作日需要覆盖 3 个楼层区域：
 
@@ -160,14 +165,30 @@ assignments: dict[str, list[list[list[bool]]]]
 | `floor_2_3` | 2-3楼 | 1 人 |
 | `floor_4_5` | 4-5楼 | 1 人 |
 
+> 权威来源：`PARAMS_REGISTRY.yaml → slots`。`rules.json` 已正式废弃，不再创建。
+
 ---
 
 ## CP-SAT 约束层级
 
-1. **硬约束 — 覆盖**：每个活跃工作日的每个槽位必须恰好有规定人数。
-2. **硬约束 — 无分身**：每位教师每天最多分配 1 个槽位。
-3. **硬约束 — 请假强制**：`unavailable` 中的天数绝对禁止排班（BoolVar 强制为 0）。
-4. **软→硬约束 — 负载均衡**：每位教师在整个排班周期内的总值班次数必须在 `[min_duties_total, max_duties_total]` 范围内（来自 PARAMS_REGISTRY）。
+### 硬约束
+1. **HC-1 — 覆盖**：每个活跃工作日的每个槽位必须恰好有规定人数。
+2. **HC-2 — 无分身**：每位教师每天最多分配 1 个槽位。
+3. **HC-3 — 周上限**：每位教师每周最多值班 1 次。
+4. **HC-4 — 月上限**：标有"一个月只能1次"的教师上限1次，否则上限2次。
+5. **HC-5 — 周末互斥**：每位教师 `sum(周五) + sum(周日) ≤ 1`。
+6. **HC-6 — 极差约束**：组内（班主任组/非班主任组各自独立）新增次数的极差 `max - min ≤ 1`，分别对总次数/周五/周日三个维度执行。成员数 ≤1 的组跳过。
+
+### 软目标函数（最大化）
+- `pref_banzhuren_weekend`（100）：班主任排在周五/周日。
+- `pref_english_mon_thu`（50）：英语老师排在周一/周四。
+- `pref_chinese_tue`（50）：语文老师排在周二。
+- `pref_politics_wed`（50）：政治老师排在周三。
+- **SC-1** `pref_non_banzhuren_double`（40）：非班主任新增次数 × 权重，鼓励非班主任优先填满2次配额。
+- **SC-2** `pref_spacing_gap`（30）：同一老师两次排班间隔 ≥ `min_week_gap` 周时给予奖励。
+- **SC-3** `penalty_avg_deviation`（-80）：惩罚每位老师偏离月均目标次数（`|新增次数 - 目标|`）。
+- **SC-4** `penalty_bz_non_weekend`（-200）：惩罚班主任出现在周一至周四。即使加上学科偏好（+50）和间隔奖励（+30），净得分仍为负，求解器主动回避。
+- **SC-5** `penalty_non_bz_weekend_double`（-150）：惩罚非班主任"本月已排周五/日 ≥ 1 次 且 总次数 ≥ 2"的情况，引导第二次值班优先分配给尚未排过周末的老师。
 
 ---
 
