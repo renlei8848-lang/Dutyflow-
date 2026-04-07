@@ -24,3 +24,6 @@ data/
 # 日志
 *.log
 logs/
+
+# 求解器调试输出（每次运行自动生成）
+debug_solver_run.txt

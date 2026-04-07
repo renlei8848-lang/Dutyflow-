@@ -1,18 +1,54 @@
 """
-clean_schedule.py — 晚自修排版.xlsx 数据清洗脚本
+clean_schedule.py — 数据清洗与归档脚本
+════════════════════════════════════════
 
-功能：
-1. "次数"sheet 楼层标准化（2/3楼→2-3楼，4/5楼→4-5楼）
-2. "次数"sheet 为班主任追加"班主任"标签（Col E 要求）
-3. "次数"sheet 末尾补录5位排班表中存在但名单中缺失的老师
-4. 新建"清洗后数据"sheet，汇总各老师历史值班统计
+【核心功能】
+  对晚自修排班 Excel 文件进行清洗、统计和归档，为求解器提供准确的历史数据基础。
+  每次确认新月份排班无误、在 Excel 中完成改名后运行本脚本。
+
+【核心逻辑】
+  Step 1 · 修正"次数"sheet
+    - 楼层字段标准化：2楼/3楼 → 2-3楼，4楼/5楼 → 4-5楼
+    - 清除"要求"列中残留的"班主任"字样（防止重复追加）
+
+  Step 2 · 统计历史值班次数
+    - 只扫描 sheet 名格式严格为 "YYYY年M月" 的 sheet（如 2025年9月、2026年3月）
+    - 兼容两种 sheet 内容格式：
+        旧格式：含"星期"列，值为"一""二"…"日"
+        新格式：含"日期"列，值为"5月6日(周二)"
+    - 对"全体班主任"特殊标记，自动展开为全员计数
+
+  Step 2.5 · 同步状态文件
+    - 读取 scheduling_state.json 中的 generated_months
+    - 将 Excel 中已有数据但未记录的月份自动补充，并更新 last_generated
+
+  Step 3 · 重建"清洗后数据"sheet
+    - 优先保留已有"清洗后数据"的 A–G 列（人工编辑内容不被覆盖）
+    - 重新计算 H–M 列：历史总次数 / 周五次数 / 周日次数 / 三项月均值
+
+【使用方法】
+  1. 在 Excel 中将"2026年5月排班（暂定）"重命名为"2026年5月"
+  2. 打开终端，运行：
+       python clean_schedule.py
+  3. 检查输出日志，确认月份统计和状态文件更新正确
+
+  ⚠ 老师的增删、楼层、要求等基本资料请直接在"次数"sheet 中手动修改，
+     本脚本不再自动补录老师。
 """
 
+import json
+import pathlib
+import re
 import sys
 import openpyxl
 from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+_STATE_PATH = pathlib.Path(__file__).parent / "scheduling_state.json"
+
+# 匹配 "YYYY年M月" 或 "YYYY年MM月" 格式的 sheet 名
+_MONTHLY_SHEET_RE = re.compile(r'^\d{4}年\d{1,2}月$')
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
 EXCEL_PATH = r"c:/Users/31249/Desktop/晚自修排版.xlsx"
@@ -24,17 +60,19 @@ BANZHUREN = {
     "肖中海",
 }
 
-# 在月份排班表中出现但"次数"名单中缺失的老师（含已知元数据）
-MISSING_TEACHERS = [
-    {"name": "余海雷", "subject": None,  "grade": None, "req": "不排了", "floor": None},
-    {"name": "刘杨",   "subject": "数学", "grade": None, "req": None,    "floor": None},
-    {"name": "潘有容", "subject": "化学", "grade": None, "req": None,    "floor": None},
-    {"name": "王詹航", "subject": None,  "grade": None, "req": "不排了", "floor": None},
-    {"name": "田宇成", "subject": "物理", "grade": None, "req": None,    "floor": None},
-]
+def is_monthly_sheet(name: str) -> bool:
+    """返回True表示该sheet是合法的历史月份数据（格式：YYYY年M月）。"""
+    return bool(_MONTHLY_SHEET_RE.match(name))
 
-# 月份sheet由运行时动态检测（排除固定sheet），无需手动维护
-EXCLUDE_SHEETS = {"次数", "清洗后数据", "test"}
+
+def sheet_name_to_month_key(name: str) -> str | None:
+    """将 "2025年9月" 转换为 "2025-09"，不匹配则返回 None。"""
+    m = _MONTHLY_SHEET_RE.match(name)
+    if not m:
+        return None
+    year, month = name.split("年")
+    month = month.rstrip("月")
+    return f"{year}-{int(month):02d}"
 
 FLOOR_MAP = {
     "2楼": "2-3楼",
@@ -64,10 +102,10 @@ def normalize_floor(floor: str | None) -> str | None:
 
 
 def find_header_row_idx(ws) -> int | None:
-    """返回包含"星期"的行号（1-based）。"""
+    """返回包含"星期"或"日期"的行号（1-based）。兼容旧格式和solver新格式。"""
     for row in ws.iter_rows():
         for cell in row:
-            if cell.value == "星期":
+            if cell.value in ("星期", "日期"):
                 return cell.row
     return None
 
@@ -83,72 +121,40 @@ def col_index_by_name(ws, header_row_idx: int, name: str) -> int | None:
 # ── Step 1：修改"次数"sheet ──────────────────────────────────────────────────
 
 def patch_cishu_sheet(ws_cishu: openpyxl.worksheet.worksheet.Worksheet):
-    existing_teachers: set[str] = set()
-    last_id = 0
-
     for row in ws_cishu.iter_rows(min_row=2):
-        id_cell     = row[0]   # Col A：序号
         name_cell   = row[1]   # Col B：姓名
         yaoqiu_cell = row[4]   # Col E：要求
         floor_cell  = row[5]   # Col F：楼层
 
-        name = name_cell.value
-        if not name:
+        if not name_cell.value:
             continue
-
-        name = str(name).strip()
-        existing_teachers.add(name)
-
-        # 记录最大序号
-        if id_cell.value and isinstance(id_cell.value, (int, float)):
-            last_id = max(last_id, int(id_cell.value))
 
         # 楼层标准化
         floor_cell.value = normalize_floor(floor_cell.value)
 
-        # 清除要求列中可能已写入的"班主任"标签
+        # 清除要求列中可能已写入的"班主任"标签（防止重复追加）
         if yaoqiu_cell.value and "班主任" in str(yaoqiu_cell.value):
             cleaned = "，".join(
                 p for p in str(yaoqiu_cell.value).split("，") if p.strip() != "班主任"
             )
             yaoqiu_cell.value = cleaned if cleaned else None
 
-    # 补录或更新缺失老师
-    name_to_row: dict[str, tuple] = {}
-    for row in ws_cishu.iter_rows(min_row=2):
-        if row[1].value:
-            name_to_row[str(row[1].value).strip()] = row
-
-    added = 0
-    for teacher in MISSING_TEACHERS:
-        tname = teacher["name"]
-        if tname in name_to_row:
-            # 已存在：仅用元数据填充仍为空的字段，不覆盖用户已填写的值
-            row = name_to_row[tname]
-            if row[2].value is None and teacher["subject"]:
-                row[2].value = teacher["subject"]
-            if row[3].value is None and teacher["grade"]:
-                row[3].value = teacher["grade"]
-            if row[4].value is None and teacher["req"]:
-                row[4].value = teacher["req"]
-            if row[5].value is None and teacher["floor"]:
-                row[5].value = normalize_floor(teacher["floor"])
-        else:
-            # 不存在：追加新行
-            last_id += 1
-            ws_cishu.append([
-                last_id, tname,
-                teacher["subject"], teacher["grade"],
-                teacher["req"],
-                normalize_floor(teacher["floor"]) if teacher["floor"] else None,
-            ])
-            added += 1
-            print(f"  补录：{tname}（序号 {last_id}）")
-
-    print(f"次数 sheet 修改完成，补录 {added} 人。")
+    print("次数 sheet 修改完成（楼层标准化、班主任标签清理）。")
 
 
 # ── Step 2：统计月份排班 ──────────────────────────────────────────────────────
+
+def extract_day_from_date_label(val) -> str | None:
+    """从 solver 新格式'5月6日(周二)'中提取星期字符'二'。"""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if "(" in s and ")" in s:
+        inner = s[s.index("(") + 1: s.index(")")]  # "周二"
+        if inner.startswith("周") and len(inner) == 2 and inner[-1] in VALID_DAYS:
+            return inner[-1]
+    return None
+
 
 def collect_duty_counts(wb) -> tuple[dict, dict, dict, int, list[str]]:
     total_count   = defaultdict(int)
@@ -157,7 +163,7 @@ def collect_duty_counts(wb) -> tuple[dict, dict, dict, int, list[str]]:
     active_months = 0
     active_list   = []
 
-    monthly_sheets = [s for s in wb.sheetnames if s not in EXCLUDE_SHEETS]
+    monthly_sheets = [s for s in wb.sheetnames if is_monthly_sheet(s)]
 
     for sheet_name in monthly_sheets:
         if not sheet_name:
@@ -166,10 +172,16 @@ def collect_duty_counts(wb) -> tuple[dict, dict, dict, int, list[str]]:
         ws = wb[sheet_name]
         hdr_row = find_header_row_idx(ws)
         if hdr_row is None:
-            print(f"  跳过（未找到'星期'列）：{sheet_name}")
+            print(f"  跳过（未找到'星期'或'日期'列）：{sheet_name}")
             continue
 
-        col_day  = col_index_by_name(ws, hdr_row, "星期")
+        # 支持旧格式（"星期"列）和新格式（"日期"列，值如"5月6日(周二)"）
+        col_day = col_index_by_name(ws, hdr_row, "星期")
+        use_date_format = False
+        if col_day is None:
+            col_day = col_index_by_name(ws, hdr_row, "日期")
+            use_date_format = True
+
         col_1    = col_index_by_name(ws, hdr_row, "1楼")
         col_23   = col_index_by_name(ws, hdr_row, "2-3楼")
         col_45   = col_index_by_name(ws, hdr_row, "4-5楼")
@@ -179,7 +191,10 @@ def collect_duty_counts(wb) -> tuple[dict, dict, dict, int, list[str]]:
         has_data = False
         for row in ws.iter_rows(min_row=hdr_row + 1):
             raw_day = row[col_day - 1].value if col_day else None
-            day = extract_day(raw_day)
+            if use_date_format:
+                day = extract_day_from_date_label(raw_day)
+            else:
+                day = extract_day(raw_day)
             if day is None:
                 continue
 
@@ -214,6 +229,42 @@ def collect_duty_counts(wb) -> tuple[dict, dict, dict, int, list[str]]:
 
     print(f"有数据的月份（{active_months}个）：{active_list}")
     return total_count, friday_count, sunday_count, active_months, active_list
+
+
+# ── Step 2.5：同步 scheduling_state.json ────────────────────────────────────
+
+def sync_state_file(active_list: list[str]) -> None:
+    """
+    将 Excel 中已有数据的月份 sheet（格式 YYYY年M月）同步到 scheduling_state.json。
+    若某月已在 Excel 中归档但未记录在 generated_months，则自动补充。
+    """
+    if not _STATE_PATH.exists():
+        print("  scheduling_state.json 不存在，跳过状态同步。")
+        return
+
+    state = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+    generated: list[str] = state.get("generated_months", [])
+
+    added: list[str] = []
+    for sheet_name in active_list:
+        key = sheet_name_to_month_key(sheet_name)
+        if key and key not in generated:
+            generated.append(key)
+            added.append(f"{sheet_name} → {key}")
+
+    if added:
+        generated.sort()
+        state["generated_months"] = generated
+        state["last_generated"] = generated[-1]
+        _STATE_PATH.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"  scheduling_state.json 补充了 {len(added)} 个月份：")
+        for a in added:
+            print(f"    {a}")
+        print(f"  last_generated 更新为：{state['last_generated']}")
+    else:
+        print("  scheduling_state.json 无需更新（所有月份已记录）。")
 
 
 # ── Step 3：生成"清洗后数据"sheet ─────────────────────────────────────────────
@@ -301,7 +352,10 @@ def main():
     patch_cishu_sheet(ws_cishu)
 
     print("\n── Step 2：统计月份排班 ──")
-    total_count, friday_count, sunday_count, active_months, _ = collect_duty_counts(wb)
+    total_count, friday_count, sunday_count, active_months, active_list = collect_duty_counts(wb)
+
+    print("\n── Step 2.5：同步 scheduling_state.json ──")
+    sync_state_file(active_list)
 
     print("\n── Step 3：生成清洗后数据 ──")
     build_clean_sheet(wb, ws_cishu, total_count, friday_count, sunday_count, active_months)

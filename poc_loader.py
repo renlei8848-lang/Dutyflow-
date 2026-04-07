@@ -1,11 +1,33 @@
 """
-poc_loader.py — Phase 1: Data Loader
-Reads the "清洗后数据" sheet from 晚自修排版.xlsx and returns List[TeacherRecord].
+poc_loader.py — 教师数据加载器
+════════════════════════════════════════
 
-Module boundaries (from ARCHITECTURE.md):
-  - No solver logic here.
-  - No LLM calls at runtime.
-  - No hardcoded sheet names or column names (all from PARAMS_REGISTRY.yaml).
+【核心功能】
+  读取 Excel 文件中的"清洗后数据"sheet，将每行教师记录解析为
+  不可变的 TeacherRecord 数据类，供求解器使用。
+
+【核心逻辑】
+  · 读取"清洗后数据"sheet（由 clean_schedule.py 生成）
+  · 校验所有必需列是否存在（序号、姓名、楼层、要求等）
+  · 月均列名含动态月份后缀（如"月均次数/8月"），使用模糊匹配定位
+  · 逐行构建 TeacherRecord（冻结数据类），包含：
+      - 基本信息：序号、姓名、学科、楼层、是否班主任
+      - 约束标签：从"要求"列解析，如"不排了""不要周日""一个月只能1次"
+      - 历史统计：历史总次数、周五次数、周日次数及对应月均值
+  · 无楼层且未标注"不排了"的教师自动注入"不排了"标签，防止求解器报错
+
+【使用方法】
+  通常由 main.py / poc_solver.py 自动调用，无需单独运行。
+  若需验证数据加载结果，可直接执行：
+      python poc_loader.py
+  或指定 Excel 路径：
+      python poc_loader.py "C:/path/to/晚自修排版.xlsx"
+  输出前3条和最后1条记录用于人工核查。
+
+  模块边界（不可跨越）：
+    · 本模块只做数据读取和转换，不含任何求解逻辑
+    · 所有 sheet 名、列名等配置均来自 PARAMS_REGISTRY.yaml
+    · 运行时不调用任何 LLM/AI 接口
 """
 
 from __future__ import annotations

@@ -8,24 +8,14 @@
 
 ## Active
 
-### DEBT-003 · 临时性特殊要求处理方法构建
+### DEBT-001 · BANZHUREN hardcoded in clean_schedule.py
 - **Introduced**: 2026-04-06
-- **Description**: 目前无法在求解器中声明一次性临时约束（如假期封锁、全体班主任强制出勤、
-  单人某月豁免等）。现有架构中硬约束全部硬编码，无法按月动态注入。
-  `临时要求.md` 已建立，用于人工记录待处理事项，但程序侧尚未实现读取和应用逻辑。
-- **Impact**: 中等 — 每遇特殊月份需手动修改清洗后数据或求解器参数，易遗漏。
-- **Resolution**: 设计 `临时约束` 数据结构（如 JSON），由 poc_solver 在 `_create_variables`
-  阶段读取并注入封锁日期或强制分配约束。
-
-
-### DEBT-001 · BANZHUREN / MISSING_TEACHERS hardcoded in clean_schedule.py
-- **Introduced**: 2026-04-06
-- **Description**: The 班主任 name set (now 16 people; 肖中海 added 2026-04-06) and the
-  5 supplemental teacher records are hardcoded as Python literals in `clean_schedule.py`.
-  Per Golden Rule 4.1 these should ideally live in a config file.
-- **Impact**: Low — these change rarely; editing the script is acceptable for now.
-- **Resolution**: Move to `data_config.yaml` when a second maintainer joins or when
-  the list changes frequently.
+- **Description**: The 班主任 name set (16 people; 肖中海 added 2026-04-06) is hardcoded
+  as a Python literal in `clean_schedule.py`. Per Golden Rule 4.1 this should ideally live
+  in a config file. MISSING_TEACHERS was removed 2026-04-07 (step 0 workflow: user now
+  manually maintains the "次数" sheet directly).
+- **Impact**: Low — changes rarely; editing the script is acceptable for now.
+- **Resolution**: Move to `data_config.yaml` when the list changes frequently.
 
 ### DEBT-002 · 楼层 / 年级 still empty for 余海雷 and 王詹航
 - **Introduced**: 2026-04-06
@@ -38,6 +28,12 @@
 ---
 
 ## Completed
+
+### DONE-005 · 真实日历时间轴 + 月份自动衔接 + 特殊日期支持
+- **Completed**: 2026-04-07
+- **Description**: 引入 `build_schedule_days()` 真实日历函数；新增 `scheduling_state.json` 和 `special_dates.json`；
+  `main.py` 完整编排器实现；`clean_schedule.py` 删除补录逻辑，新增日期列兼容与状态同步；
+  输出 sheet 改为"YYYY年M月排班（暂定）"。求解时限 60s → 180s → 300s。
 
 ### DONE-004 · 班主任有概率被排两次（求解器次优部分）
 - **Completed**: 2026-04-07
@@ -56,6 +52,13 @@
   Note: HC-6 applies to *new* assignments only (not projected historical totals) because the
   existing historical data already has imbalances up to range=11 in non-BZ total, which cannot
   be corrected in a single scheduling cycle.
+
+### DONE-003 · 真实日历时间轴 + 月份自动衔接 + 特殊日期支持
+- **Completed**: 2026-04-07
+- **Description**: 引入 `build_schedule_days()` 日历函数，poc_solver 改为真实日历枚举；
+  新增 `scheduling_state.json`（月份状态文件）和 `special_dates.json`（节假日/调休/全体班主任日配置）；
+  `main.py` 实现完整编排器；`clean_schedule.py` 删除补录逻辑，增加"日期"列兼容和动态 sheet 排除。
+  输出 sheet 命名为"X月排班（暂定）"，用户确认后手动改名归档。
 
 ### DONE-001 · 晚自修排版.xlsx data cleaning (clean_schedule.py)
 - **Completed**: 2026-04-06

@@ -1,17 +1,64 @@
 """
-poc_solver.py — Phase 3: CP-SAT Solver
-Builds and solves the duty-roster scheduling model, then exports the result to Excel.
+poc_solver.py — CP-SAT 排班求解器
+════════════════════════════════════════
 
-Module boundaries (from ARCHITECTURE.md):
-  - No I/O or data-loading here — receives List[TeacherRecord] from poc_loader.
-  - No LLM calls at runtime.
-  - All numeric constants come from PARAMS_REGISTRY.yaml via the config dict.
+【核心功能】
+  接收教师数据列表，基于真实日历构建约束规划模型，求解最优值班方案，
+  并将结果导出到 Excel 文件的指定 sheet。
+
+【核心逻辑】
+  日历构建（build_schedule_days）
+    · 枚举目标月所有日期，保留周一至周五和周日为值班日
+    · 按 special_dates.json 配置：剔除节假日区间、加入调休周六、
+      在全体班主任活动日抑制班主任的变量创建
+    · 按 ISO 周分组，分配 week_idx（用于周次上限约束）
+
+  变量矩阵（_create_variables）
+    · 稀疏 BoolVar 矩阵，键为 (teacher_id, week_idx, day_of_week, slot_id)
+    · 仅为楼层匹配、标签合法的教师创建变量
+
+  硬约束（HC-1 ~ HC-6）
+    · HC-1 覆盖率：每个值班日每个楼层恰好1人
+    · HC-2 不重排：同一教师同一天最多1个楼层
+    · HC-3 周次上限：每位教师每周最多1次
+    · HC-4 月次上限：每位教师每月最多2次（标注"一个月只能1次"者限1次）
+    · HC-5 周末互斥：周五和周日合计最多1次
+    · HC-6 极差约束：同组教师（班主任/非班主任）本月新排次数极差 ≤ 1
+
+  软约束目标函数（SC-1 ~ SC-5，最大化）
+    · 学科/星期偏好奖励（班主任排周末、英语排周一/四、语文排周二、政治排周三）
+    · 班主任排非周末惩罚（SC-4）
+    · 非班主任多排奖励、间隔拉开奖励（SC-1/SC-2）
+    · 偏离月均目标惩罚（SC-3）
+    · 非班主任周末双排惩罚（SC-5）
+
+  输出
+    · Sheet 名格式：{year}年{month}月排班（暂定），如"2026年5月排班（暂定）"
+    · 日期列格式："5月6日(周二)"
+    · 班主任单元格橙黄色高亮
+
+【使用方法】
+  通常由 main.py 调用，无需单独运行。
+  若需单独测试，可直接执行：
+      python poc_solver.py
+  或指定 Excel 路径和目标月：
+      python poc_solver.py "C:/path/to/晚自修排版.xlsx" "2026-05"
+  结果写入 Excel，调试报告写入 debug_solver_run.txt。
+
+  模块边界（不可跨越）：
+    · 本模块不读取 Excel，仅接收 List[TeacherRecord]
+    · 所有数值常量来自 PARAMS_REGISTRY.yaml
+    · 运行时不调用任何 LLM/AI 接口
 """
 
 from __future__ import annotations
 
+import calendar
+import datetime
+import json
 import pathlib
-from itertools import product
+from collections import namedtuple
+from datetime import date, timedelta
 
 import pandas as pd
 import yaml
@@ -24,6 +71,8 @@ from poc_loader import TeacherRecord, load_teacher_records
 # Module-level constants
 # ---------------------------------------------------------------------------
 _REGISTRY_PATH = pathlib.Path(__file__).parent / ".dutyflow_meta" / "PARAMS_REGISTRY.yaml"
+_STATE_PATH = pathlib.Path(__file__).parent / "scheduling_state.json"
+_SPECIAL_DATES_PATH = pathlib.Path(__file__).parent / "special_dates.json"
 
 with _REGISTRY_PATH.open(encoding="utf-8") as _f:
     _CFG = yaml.safe_load(_f)
@@ -38,25 +87,121 @@ SLOT_ZONE: dict[str, str] = {
 }
 SLOT_IDS: list[str] = list(SLOT_ZONE.keys())
 
-# Day indices within a 7-day week (0=Mon … 6=Sun)
-ACTIVE_DAYS: list[int] = [0, 1, 2, 3, 4, 6]
-
+# Day-of-week index → display name (Python weekday: 0=Mon … 4=Fri, 5=Sat, 6=Sun)
 DAY_NAMES: dict[int, str] = {
-    0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 6: "周日",
+    0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日",
 }
+
+# Base duty weekdays per Python weekday() convention (Mon–Fri + Sun, excluding Sat)
+_BASE_DUTY_WEEKDAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4, 6})
+
+# ---------------------------------------------------------------------------
+# Calendar helper
+# ---------------------------------------------------------------------------
+ScheduleDay = namedtuple("ScheduleDay", ["date", "week_idx", "day_of_week"])
+"""
+A single duty day in the scheduling cycle.
+  date        — actual calendar date (datetime.date)
+  week_idx    — 0-based sequential week index within this month (drives HC-3)
+  day_of_week — Python weekday int (0=Mon … 4=Fri, 5=Sat, 6=Sun)
+"""
+
+
+def build_schedule_days(year: int, month: int, special_cfg: dict) -> list[ScheduleDay]:
+    """
+    Compute all duty days for a given (year, month) given special-date configuration.
+
+    special_cfg keys (all optional):
+      holiday_ranges       — list of [start_str, end_str] date ranges (inclusive); removed from duty days
+      extra_workdays       — list of date strings for makeup workdays (Saturdays); added to duty days
+      all_bz_required_days — dates where BZ teachers must attend; suppressed in _create_variables
+
+    Returns a list of ScheduleDay sorted by date.
+    """
+    # Parse holiday date ranges
+    holiday_dates: set[date] = set()
+    for pair in special_cfg.get("holiday_ranges", []):
+        cur = date.fromisoformat(pair[0])
+        end = date.fromisoformat(pair[1])
+        while cur <= end:
+            holiday_dates.add(cur)
+            cur += timedelta(days=1)
+
+    # Parse extra workdays (makeup Saturdays)
+    extra_workday_dates: set[date] = {
+        date.fromisoformat(s) for s in special_cfg.get("extra_workdays", [])
+    }
+
+    # Enumerate all duty dates for this month
+    _, num_days = calendar.monthrange(year, month)
+    duty_dates: list[date] = []
+    seen: set[date] = set()
+
+    for day_num in range(1, num_days + 1):
+        d = date(year, month, day_num)
+        if d in holiday_dates:
+            continue
+        if d.weekday() in _BASE_DUTY_WEEKDAYS or d in extra_workday_dates:
+            duty_dates.append(d)
+            seen.add(d)
+
+    # Extra workdays might be Saturdays (not in _BASE_DUTY_WEEKDAYS); add if not already included
+    for d in sorted(extra_workday_dates):
+        if d.year == year and d.month == month and d not in seen and d not in holiday_dates:
+            duty_dates.append(d)
+    duty_dates.sort()
+
+    # Group by ISO (year, week) → assign sequential week_idx
+    iso_weeks: list[tuple[int, int]] = []
+    iso_seen: set[tuple[int, int]] = set()
+    for d in duty_dates:
+        yw: tuple[int, int] = d.isocalendar()[:2]
+        if yw not in iso_seen:
+            iso_weeks.append(yw)
+            iso_seen.add(yw)
+    week_idx_map: dict[tuple[int, int], int] = {yw: i for i, yw in enumerate(iso_weeks)}
+
+    return [
+        ScheduleDay(
+            date=d,
+            week_idx=week_idx_map[d.isocalendar()[:2]],
+            day_of_week=d.weekday(),
+        )
+        for d in duty_dates
+    ]
+
+
+def _next_month(last: str) -> str:
+    """Increment a 'YYYY-MM' string by one month."""
+    year, month = map(int, last.split("-"))
+    month += 1
+    if month > 12:
+        month = 1
+        year += 1
+    return f"{year:04d}-{month:02d}"
 
 
 # ---------------------------------------------------------------------------
 # Solver class
 # ---------------------------------------------------------------------------
 class DutySolver:
-    def __init__(self, records: list[TeacherRecord], config: dict) -> None:
+    def __init__(
+        self,
+        records: list[TeacherRecord],
+        config: dict,
+        target_month: str,
+        special_dates: dict | None = None,
+    ) -> None:
+        """
+        target_month  : "YYYY-MM" string for the scheduling cycle (e.g. "2026-05").
+        special_dates : dict from special_dates.json for this month, or {} / None.
+        """
         self._records = records
         self._config = config
         self._by_id: dict[int, TeacherRecord] = {t.teacher_id: t for t in records}
+        self._target_month = target_month
 
         # Config extraction
-        self._num_weeks: int = config["schedule"]["num_weeks"]
         self._headcount: dict[str, int] = {
             sid: config["slots"][sid]["required_headcount"] for sid in SLOT_IDS
         }
@@ -65,7 +210,6 @@ class DutySolver:
         self._num_workers: int = int(config["solver"]["num_search_workers"])
         self._seed: int = int(config["solver"]["random_seed"])
         self._log_progress: bool = bool(config["solver"]["log_search_progress"])
-        self._output_sheet_name: str = config["output"]["output_sheet_name"]
 
         mt = config["monthly_targets"]
         self._bz_target: int = int(mt["banzhuren_target"])
@@ -73,11 +217,33 @@ class DutySolver:
         self._max_projected_range: int = int(mt["max_projected_range"])
         self._min_week_gap: int = int(config["soft_constraints"]["min_week_gap"])
 
+        # Calendar: build real duty days for this month
+        special_cfg: dict = special_dates or {}
+        year, month = map(int, target_month.split("-"))
+        self._schedule_days: list[ScheduleDay] = build_schedule_days(year, month, special_cfg)
+        self._num_weeks: int = len({sd.week_idx for sd in self._schedule_days})
+
+        # Fast lookup: (week_idx, day_of_week) → actual date
+        self._date_by_wd: dict[tuple[int, int], date] = {
+            (sd.week_idx, sd.day_of_week): sd.date for sd in self._schedule_days
+        }
+
+        # Dates where all BZ teachers must attend (duty variable suppressed for BZ on these dates)
+        self._all_bz_days: set[date] = {
+            date.fromisoformat(s) for s in special_cfg.get("all_bz_required_days", [])
+        }
+
+        # Output sheet name, e.g. "2026年5月排班（暂定）"
+        sheet_fmt: str = config["output"]["output_sheet_name_format"]
+        self._output_sheet_name: str = (
+            sheet_fmt.replace("{year}", str(year)).replace("{month}", str(month))
+        )
+
         # CP-SAT objects (populated by _build)
         self.model = cp_model.CpModel()
         self.x: dict[tuple, cp_model.IntVar] = {}
 
-        # Per-teacher IntVars for new assignment counts (populated by _precompute_teacher_totals)
+        # Per-teacher IntVars (populated by _precompute_teacher_totals)
         self._new_total: dict[int, cp_model.IntVar] = {}
         self._new_friday: dict[int, cp_model.IntVar] = {}
         self._new_sunday: dict[int, cp_model.IntVar] = {}
@@ -86,6 +252,16 @@ class DutySolver:
         self.solver_status: int | None = None
 
         self._build()
+
+    # -----------------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------------
+    def _date_label(self, w: int, d: int) -> str:
+        """Return a human-readable label like '5月6日(周二)' for a (week_idx, day_of_week) pair."""
+        actual = self._date_by_wd.get((w, d))
+        if actual is None:
+            return f"第{w + 1}周{DAY_NAMES.get(d, str(d))}"
+        return f"{actual.month}月{actual.day}日({DAY_NAMES[d]})"
 
     # -----------------------------------------------------------------------
     # Internal: model construction
@@ -102,25 +278,28 @@ class DutySolver:
         for t in self._records:
             if "不排了" in t.tags:
                 continue
-            for w, d, slot_id in product(
-                range(self._num_weeks), ACTIVE_DAYS, SLOT_IDS
-            ):
-                if t.floor_zone != SLOT_ZONE[slot_id]:
+            for sd in self._schedule_days:
+                w = sd.week_idx
+                d = sd.day_of_week
+                # Suppress BZ variables on all-BZ mandatory attendance days
+                if t.is_banzhuren and sd.date in self._all_bz_days:
                     continue
                 if d == 4 and "不要周五" in t.tags:
                     continue
                 if d == 6 and "不要周日" in t.tags:
                     continue
-                key = (t.teacher_id, w, d, slot_id)
-                self.x[key] = self.model.NewBoolVar(
-                    f"x_{t.teacher_id}_{w}_{d}_{slot_id}"
-                )
+                for slot_id in SLOT_IDS:
+                    if t.floor_zone != SLOT_ZONE[slot_id]:
+                        continue
+                    key = (t.teacher_id, w, d, slot_id)
+                    self.x[key] = self.model.NewBoolVar(
+                        f"x_{t.teacher_id}_{w}_{d}_{slot_id}"
+                    )
 
     def _precompute_teacher_totals(self) -> None:
         """
-        For each active teacher (has at least one x-variable), create IntVars that sum
-        their new assignments across all weeks/days/slots.  These are reused by both
-        _add_range_constraints (projected history check) and _set_objective (soft terms).
+        For each active teacher (has at least one x-variable), create IntVars summing
+        their new assignments. Reused by _add_range_constraints and _set_objective.
         """
         for t in self._records:
             tid = t.teacher_id
@@ -134,37 +313,40 @@ class DutySolver:
             self.model.Add(new_total == sum(all_vars))
             self._new_total[tid] = new_total
 
+            # Friday vars (d == 4)
             fri_vars = [v for (i, w, d, s), v in self.x.items() if i == tid and d == 4]
             new_friday = self.model.NewIntVar(0, cap, f"new_fri_{tid}")
             self.model.Add(new_friday == (sum(fri_vars) if fri_vars else 0))
             self._new_friday[tid] = new_friday
 
+            # Sunday vars (d == 6)
             sun_vars = [v for (i, w, d, s), v in self.x.items() if i == tid and d == 6]
             new_sunday = self.model.NewIntVar(0, cap, f"new_sun_{tid}")
             self.model.Add(new_sunday == (sum(sun_vars) if sun_vars else 0))
             self._new_sunday[tid] = new_sunday
 
     def _add_hard_constraints(self) -> None:
-        # HC-1: Coverage — every (w, d, slot) must have exactly required_headcount teachers
-        for w, d, slot_id in product(
-            range(self._num_weeks), ACTIVE_DAYS, SLOT_IDS
-        ):
-            slot_vars = [
-                self.x[(tid, w, d, slot_id)]
-                for tid in self._by_id
-                if (tid, w, d, slot_id) in self.x
-            ]
-            if not slot_vars:
-                raise RuntimeError(
-                    f"No eligible teachers for slot '{slot_id}' "
-                    f"on week {w}, day index {d} ({DAY_NAMES[d]}). "
-                    "Check floor assignments and tags in 清洗后数据 sheet."
-                )
-            self.model.Add(sum(slot_vars) == self._headcount[slot_id])
+        # HC-1: Coverage — every duty day × slot must have exactly required_headcount teachers
+        for sd in self._schedule_days:
+            w, d = sd.week_idx, sd.day_of_week
+            for slot_id in SLOT_IDS:
+                slot_vars = [
+                    self.x[(tid, w, d, slot_id)]
+                    for tid in self._by_id
+                    if (tid, w, d, slot_id) in self.x
+                ]
+                if not slot_vars:
+                    raise RuntimeError(
+                        f"No eligible teachers for slot '{slot_id}' "
+                        f"on {self._date_label(w, d)}. "
+                        "Check floor assignments and tags in 清洗后数据 sheet."
+                    )
+                self.model.Add(sum(slot_vars) == self._headcount[slot_id])
 
         # HC-2: No-clone — each teacher at most 1 slot per day
         for t in self._records:
-            for w, d in product(range(self._num_weeks), ACTIVE_DAYS):
+            for sd in self._schedule_days:
+                w, d = sd.week_idx, sd.day_of_week
                 day_vars = [
                     self.x[(t.teacher_id, w, d, s)]
                     for s in SLOT_IDS
@@ -177,9 +359,10 @@ class DutySolver:
         for t in self._records:
             for w in range(self._num_weeks):
                 week_vars = [
-                    self.x[(t.teacher_id, w, d, s)]
-                    for d, s in product(ACTIVE_DAYS, SLOT_IDS)
-                    if (t.teacher_id, w, d, s) in self.x
+                    self.x[(t.teacher_id, w, sd.day_of_week, s)]
+                    for sd in self._schedule_days if sd.week_idx == w
+                    for s in SLOT_IDS
+                    if (t.teacher_id, w, sd.day_of_week, s) in self.x
                 ]
                 if week_vars:
                     self.model.Add(sum(week_vars) <= 1)
@@ -197,14 +380,16 @@ class DutySolver:
             if "一个月只能1次" in t.tags:
                 continue  # already capped at 1 globally
             fri_vars = [
-                self.x[(t.teacher_id, w, 4, s)]
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 4, s) in self.x
+                self.x[(t.teacher_id, sd.week_idx, 4, s)]
+                for sd in self._schedule_days if sd.day_of_week == 4
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 4, s) in self.x
             ]
             sun_vars = [
-                self.x[(t.teacher_id, w, 6, s)]
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 6, s) in self.x
+                self.x[(t.teacher_id, sd.week_idx, 6, s)]
+                for sd in self._schedule_days if sd.day_of_week == 6
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 6, s) in self.x
             ]
             if fri_vars or sun_vars:
                 self.model.Add(sum(fri_vars) + sum(sun_vars) <= 1)
@@ -212,19 +397,9 @@ class DutySolver:
     def _add_range_constraints(self) -> None:
         """
         HC-6: 极差约束 — for each teacher group {BZ, non-BZ}, the range
-        (max − min) of NEW assignment counts in this scheduling cycle must not exceed
-        max_projected_range.
-
-        Note: The requirement states 历史总值班次数极差<=1 (historical running totals).
-        However, the existing historical data already has imbalances up to 11 among
-        non-BZ teachers — gaps that cannot be closed in a single month.  Applying the
-        range constraint to the NEW assignments for this cycle is the correct per-cycle
-        interpretation: this month's schedule must itself be fair (each teacher within
-        a group gets an equal number of new duties, range ≤ 1), which gradually reduces
-        the historical imbalance over successive months.
-
+        (max − min) of NEW assignment counts must not exceed max_projected_range.
         Applies independently to total / friday / sunday new counts.
-        Groups with ≤1 active teacher are skipped (range is trivially 0).
+        Groups with ≤1 active teacher are skipped.
         """
         bz_active = [
             t for t in self._records
@@ -242,10 +417,8 @@ class DutySolver:
         ) -> None:
             if len(group) <= 1:
                 return
-
-            cap = 2  # conservative upper bound for domain
+            cap = 2
             new_vars = [new_dict[t.teacher_id] for t in group]
-
             max_new = self.model.NewIntVar(0, cap, f"max_new_{label}")
             min_new = self.model.NewIntVar(0, cap, f"min_new_{label}")
             self.model.AddMaxEquality(max_new, new_vars)
@@ -261,14 +434,13 @@ class DutySolver:
         W = self._weights
         terms: list = []
 
-        # --- Existing subject/day preference terms + SC-4 ---
+        # --- Subject/day preference terms + SC-4 ---
         for (tid, w, d, slot_id), var in self.x.items():
             t = self._by_id[tid]
             if t.is_banzhuren and d in (4, 6):
                 terms.append(var * W["pref_banzhuren_weekend"])
             if t.is_banzhuren and d not in (4, 6):
-                # SC-4: penalty_bz_non_weekend
-                # 班主任出现在周一到周四，净得分为负，求解器主动回避
+                # SC-4: 班主任出现在非周末（含调休周六）时惩罚，净得分为负
                 terms.append(var * W["penalty_bz_non_weekend"])
             if t.subject == "英语" and d in (0, 3):
                 terms.append(var * W["pref_english_mon_thu"])
@@ -278,16 +450,11 @@ class DutySolver:
                 terms.append(var * W["pref_politics_wed"])
 
         # --- SC-1: pref_non_banzhuren_double ---
-        # Reward the solver for giving non-BZ teachers more assignments.
-        # When a non-BZ teacher gets 2 duties, this term contributes 2× the weight,
-        # biasing the solver to fill the 2-slot quota with non-BZ teachers first.
         for t in self._records:
             if not t.is_banzhuren and t.teacher_id in self._new_total:
                 terms.append(self._new_total[t.teacher_id] * W["pref_non_banzhuren_double"])
 
         # --- SC-2: pref_spacing_gap ---
-        # For each teacher who can get 2 assignments, reward week-pairs that are
-        # at least min_week_gap weeks apart.
         gap = self._min_week_gap
         for t in self._records:
             if "一个月只能1次" in t.tags:
@@ -296,18 +463,19 @@ class DutySolver:
             for w1 in range(self._num_weeks):
                 for w2 in range(w1 + gap, self._num_weeks):
                     w1_vars = [
-                        self.x[(tid, w1, d, s)]
-                        for d, s in product(ACTIVE_DAYS, SLOT_IDS)
-                        if (tid, w1, d, s) in self.x
+                        self.x[(tid, w1, sd.day_of_week, s)]
+                        for sd in self._schedule_days if sd.week_idx == w1
+                        for s in SLOT_IDS
+                        if (tid, w1, sd.day_of_week, s) in self.x
                     ]
                     w2_vars = [
-                        self.x[(tid, w2, d, s)]
-                        for d, s in product(ACTIVE_DAYS, SLOT_IDS)
-                        if (tid, w2, d, s) in self.x
+                        self.x[(tid, w2, sd.day_of_week, s)]
+                        for sd in self._schedule_days if sd.week_idx == w2
+                        for s in SLOT_IDS
+                        if (tid, w2, sd.day_of_week, s) in self.x
                     ]
                     if not w1_vars or not w2_vars:
                         continue
-                    # gap_ok = 1 iff teacher is assigned in both w1 and w2
                     gap_ok = self.model.NewBoolVar(f"gap_{tid}_{w1}_{w2}")
                     sum_w1 = sum(w1_vars)
                     sum_w2 = sum(w2_vars)
@@ -317,9 +485,6 @@ class DutySolver:
                     terms.append(gap_ok * W["pref_spacing_gap"])
 
         # --- SC-3: penalty_avg_deviation ---
-        # Penalize teachers whose new assignment count deviates from their monthly target.
-        # BZ target = banzhuren_target; non-BZ target = non_banzhuren_target.
-        # Uses AddAbsEquality to model |new_count - target| as an IntVar.
         penalty_weight = abs(int(W["penalty_avg_deviation"]))
         for t in self._records:
             tid = t.teacher_id
@@ -327,9 +492,8 @@ class DutySolver:
                 continue
             target = self._bz_target if t.is_banzhuren else self._non_bz_target
             cap = 1 if "一个月只能1次" in t.tags else 2
-            max_dev = max(target, cap)  # max possible deviation
+            max_dev = max(target, cap)
             dev_var = self.model.NewIntVar(0, max_dev, f"dev_{tid}")
-            # new_total - target can range from -target to cap-target
             diff_lb = -target
             diff_ub = cap - target
             diff_var = self.model.NewIntVar(diff_lb, diff_ub, f"diff_{tid}")
@@ -338,12 +502,8 @@ class DutySolver:
             terms.append(dev_var * (-penalty_weight))
 
         # --- SC-5: penalty_non_bz_weekend_double ---
-        # 触发条件: 非班主任本月已排周五/日 1 次 AND 还有第二次值班
-        # wad (weekend_and_double) = 1 iff (fri_new + sun_new == 1) AND (total_new == 2)
-        # 推导: fri+sun ∈ {0,1}（由HC-5保证），total ∈ {0,1,2}
-        #   wad=1 ⟺ fri+sun+total == 3，因此:
-        #   wad <= fri+sun              (fri+sun=0 → wad=0)
-        #   wad >= fri+sun + total - 2  (fri+sun+total=3 → wad>=1)
+        # 触发: 非班主任本月有1次周末值班(fri+sun==1) 且 总次数==2
+        # wad=1 ⟺ fri+sun+total==3  →  wad<=fri+sun  AND  wad>=fri+sun+total-2
         for t in self._records:
             if t.is_banzhuren or t.teacher_id not in self._new_total:
                 continue
@@ -365,7 +525,7 @@ class DutySolver:
         """
         Run CP-SAT search.
         Returns the status name string ("OPTIMAL" or "FEASIBLE").
-        Raises RuntimeError if the model is INFEASIBLE or search times out without a solution.
+        Raises RuntimeError if INFEASIBLE or no solution found within time limit.
         """
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = self._time_limit
@@ -395,30 +555,33 @@ class DutySolver:
     # -----------------------------------------------------------------------
     def verify_solution(self) -> list[str]:
         """
-        Post-solve: verify each HC-1 ~ HC-6 against the solved variable values.
-        Returns a list of violation strings. Empty list = no violations found.
+        Post-solve: verify HC-1 ~ HC-6 against solved variable values.
+        Returns list of violation strings; empty = no violations.
         Must be called after a successful solve().
         """
         solver = self.cp_solver
         violations: list[str] = []
 
         # HC-1: Coverage
-        for w, d, slot_id in product(range(self._num_weeks), ACTIVE_DAYS, SLOT_IDS):
-            count = sum(
-                solver.Value(self.x[(tid, w, d, slot_id)])
-                for tid in self._by_id
-                if (tid, w, d, slot_id) in self.x
-            )
-            required = self._headcount[slot_id]
-            if count != required:
-                violations.append(
-                    f"HC-1 FAIL: 第{w+1}周{DAY_NAMES[d]} {slot_id} "
-                    f"实际{count}人，要求{required}人"
+        for sd in self._schedule_days:
+            w, d = sd.week_idx, sd.day_of_week
+            for slot_id in SLOT_IDS:
+                count = sum(
+                    solver.Value(self.x[(tid, w, d, slot_id)])
+                    for tid in self._by_id
+                    if (tid, w, d, slot_id) in self.x
                 )
+                required = self._headcount[slot_id]
+                if count != required:
+                    violations.append(
+                        f"HC-1 FAIL: {self._date_label(w, d)} {slot_id} "
+                        f"实际{count}人，要求{required}人"
+                    )
 
         # HC-2: No-clone
         for t in self._records:
-            for w, d in product(range(self._num_weeks), ACTIVE_DAYS):
+            for sd in self._schedule_days:
+                w, d = sd.week_idx, sd.day_of_week
                 day_count = sum(
                     solver.Value(self.x[(t.teacher_id, w, d, s)])
                     for s in SLOT_IDS
@@ -426,20 +589,21 @@ class DutySolver:
                 )
                 if day_count > 1:
                     violations.append(
-                        f"HC-2 FAIL: {t.name} 第{w+1}周{DAY_NAMES[d]} 同天被排{day_count}次"
+                        f"HC-2 FAIL: {t.name} {self._date_label(w, d)} 同天被排{day_count}次"
                     )
 
         # HC-3: Weekly cap
         for t in self._records:
             for w in range(self._num_weeks):
                 week_count = sum(
-                    solver.Value(self.x[(t.teacher_id, w, d, s)])
-                    for d, s in product(ACTIVE_DAYS, SLOT_IDS)
-                    if (t.teacher_id, w, d, s) in self.x
+                    solver.Value(self.x[(t.teacher_id, w, sd.day_of_week, s)])
+                    for sd in self._schedule_days if sd.week_idx == w
+                    for s in SLOT_IDS
+                    if (t.teacher_id, w, sd.day_of_week, s) in self.x
                 )
                 if week_count > 1:
                     violations.append(
-                        f"HC-3 FAIL: {t.name} 第{w+1}周 被排{week_count}次"
+                        f"HC-3 FAIL: {t.name} 第{w + 1}周 被排{week_count}次"
                     )
 
         # HC-4: Monthly cap
@@ -460,14 +624,16 @@ class DutySolver:
             if "一个月只能1次" in t.tags:
                 continue
             fri_count = sum(
-                solver.Value(self.x[(t.teacher_id, w, 4, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 4, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 4, s)])
+                for sd in self._schedule_days if sd.day_of_week == 4
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 4, s) in self.x
             )
             sun_count = sum(
-                solver.Value(self.x[(t.teacher_id, w, 6, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 6, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 6, s)])
+                for sd in self._schedule_days if sd.day_of_week == 6
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 6, s) in self.x
             )
             if fri_count + sun_count > 1:
                 violations.append(
@@ -480,16 +646,18 @@ class DutySolver:
 
         def _count_fri(t: TeacherRecord) -> int:
             return sum(
-                solver.Value(self.x[(t.teacher_id, w, 4, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 4, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 4, s)])
+                for sd in self._schedule_days if sd.day_of_week == 4
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 4, s) in self.x
             )
 
         def _count_sun(t: TeacherRecord) -> int:
             return sum(
-                solver.Value(self.x[(t.teacher_id, w, 6, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 6, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 6, s)])
+                for sd in self._schedule_days if sd.day_of_week == 6
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 6, s) in self.x
             )
 
         bz_active = [
@@ -523,7 +691,7 @@ class DutySolver:
     def print_solution_summary(self, output_path: str | None = None) -> None:
         """
         Print a structured debug summary: per-teacher new-assignment counts
-        (grouped by BZ / non-BZ) and the full week-by-week schedule table.
+        and the full day-by-day schedule table with real dates.
         If output_path is given, also writes to that file (UTF-8, overwrites).
         Must be called after a successful solve().
         """
@@ -532,20 +700,22 @@ class DutySolver:
         add = lines.append
 
         add("=" * 60)
-        add("  SOLVER DEBUG SUMMARY")
+        add(f"  SOLVER DEBUG SUMMARY — {self._target_month}")
         add("=" * 60)
 
         def _counts(t: TeacherRecord) -> tuple[int, int, int]:
             total = sum(solver.Value(self.x[k]) for k in self.x if k[0] == t.teacher_id)
             fri = sum(
-                solver.Value(self.x[(t.teacher_id, w, 4, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 4, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 4, s)])
+                for sd in self._schedule_days if sd.day_of_week == 4
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 4, s) in self.x
             )
             sun = sum(
-                solver.Value(self.x[(t.teacher_id, w, 6, s)])
-                for w, s in product(range(self._num_weeks), SLOT_IDS)
-                if (t.teacher_id, w, 6, s) in self.x
+                solver.Value(self.x[(t.teacher_id, sd.week_idx, 6, s)])
+                for sd in self._schedule_days if sd.day_of_week == 6
+                for s in SLOT_IDS
+                if (t.teacher_id, sd.week_idx, 6, s) in self.x
             )
             return total, fri, sun
 
@@ -561,7 +731,7 @@ class DutySolver:
         ]:
             add(f"\n{group_label} ({len(group)}人)")
             add(f"  {'姓名':<8} {'总次数':>4} {'周五':>4} {'周日':>4}  备注")
-            add(f"  {'-'*8} {'-'*4} {'-'*4} {'-'*4}")
+            add(f"  {'-' * 8} {'-' * 4} {'-' * 4} {'-' * 4}")
             totals, fris, suns = [], [], []
             for t in sorted(group, key=lambda x: x.name):
                 total, fri, sun = _counts(t)
@@ -572,26 +742,26 @@ class DutySolver:
                 add(f"  {t.name:<8} {total:>4} {fri:>4} {sun:>4}  {note}")
             if totals:
                 add(
-                    f"  {'[极差]':<8} {max(totals)-min(totals):>4} "
-                    f"{max(fris)-min(fris):>4} {max(suns)-min(suns):>4}"
+                    f"  {'[极差]':<8} {max(totals) - min(totals):>4} "
+                    f"{max(fris) - min(fris):>4} {max(suns) - min(suns):>4}"
                 )
 
-        add(f"\n{'='*60}")
-        add("  排班明细（周 × 日 × 槽位）")
+        add(f"\n{'=' * 60}")
+        add(f"  排班明细（{self._target_month}）")
         add("=" * 60)
         unassigned = self._config["output"]["unassigned_placeholder"]
         for w in range(self._num_weeks):
-            add(f"\n  第{w+1}周:")
-            for d in ACTIVE_DAYS:
-                parts = [f"    {DAY_NAMES[d]}"]
+            add(f"\n  第{w + 1}周:")
+            week_days = [sd for sd in self._schedule_days if sd.week_idx == w]
+            for sd in week_days:
+                label = self._date_label(sd.week_idx, sd.day_of_week)
+                parts = [f"    {label}"]
                 for slot_id in SLOT_IDS:
                     zone = SLOT_ZONE[slot_id]
                     name = unassigned
                     for tid, t in self._by_id.items():
-                        if (
-                            (tid, w, d, slot_id) in self.x
-                            and solver.Value(self.x[(tid, w, d, slot_id)]) == 1
-                        ):
+                        key = (tid, sd.week_idx, sd.day_of_week, slot_id)
+                        if key in self.x and solver.Value(self.x[key]) == 1:
                             name = t.name
                             break
                     parts.append(f"{zone}:{name}")
@@ -603,7 +773,8 @@ class DutySolver:
         print(output)
 
         if output_path:
-            pathlib.Path(output_path).write_text(output, encoding="utf-8")
+            import pathlib as _pl
+            _pl.Path(output_path).write_text(output, encoding="utf-8")
             print(f"\n[debug report → {output_path}]")
 
     # -----------------------------------------------------------------------
@@ -611,8 +782,10 @@ class DutySolver:
     # -----------------------------------------------------------------------
     def export_to_excel(self, output_path: str) -> None:
         """
-        Write the solved schedule as a new sheet (output_sheet_name from config)
-        into *output_path*.  Replaces the sheet if it already exists.
+        Write the solved schedule as a new sheet into *output_path*.
+        Sheet name: e.g. "5月排班（暂定）"
+        Date labels: e.g. "5月6日(周二)"
+        Replaces the sheet if it already exists.
         Must be called after solve().
         """
         if self.cp_solver is None or self.solver_status not in (
@@ -626,8 +799,9 @@ class DutySolver:
         rows: list[dict] = []
         unassigned_placeholder: str = self._config["output"]["unassigned_placeholder"]
 
-        for w, d in product(range(self._num_weeks), ACTIVE_DAYS):
-            row: dict[str, str] = {"日期": f"第{w + 1}周{DAY_NAMES[d]}"}
+        for sd in self._schedule_days:
+            w, d = sd.week_idx, sd.day_of_week
+            row: dict[str, str] = {"日期": self._date_label(w, d)}
             for slot_id in SLOT_IDS:
                 zone = SLOT_ZONE[slot_id]
                 assigned_name = unassigned_placeholder
@@ -641,11 +815,8 @@ class DutySolver:
 
         df = pd.DataFrame(rows, columns=["日期", "1楼", "2-3楼", "4-5楼"])
 
-        # Build a set of 班主任 names for cell highlighting
         banzhuren_names: set[str] = {t.name for t in self._records if t.is_banzhuren}
-        orange_yellow = PatternFill(
-            fill_type="solid", fgColor="FFB300"  # amber / 橙黄色
-        )
+        orange_yellow = PatternFill(fill_type="solid", fgColor="FFB300")
 
         sheet_name = self._output_sheet_name
         with pd.ExcelWriter(
@@ -660,7 +831,7 @@ class DutySolver:
             # Row 1 is the header; data starts at row 2
             # Columns: A=日期, B=1楼, C=2-3楼, D=4-5楼
             for row_idx in range(2, len(rows) + 2):
-                for col_idx in range(2, 5):  # cols B, C, D
+                for col_idx in range(2, 5):
                     cell = ws.cell(row=row_idx, column=col_idx)
                     if cell.value in banzhuren_names:
                         cell.fill = orange_yellow
@@ -675,15 +846,41 @@ if __name__ == "__main__":
     import sys
 
     excel_path = sys.argv[1] if len(sys.argv) > 1 else _DEFAULT_EXCEL_PATH
+
+    # Determine target month: command-line arg, state file, or today
+    if len(sys.argv) > 2:
+        target_month = sys.argv[2]
+    elif _STATE_PATH.exists():
+        _state = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        target_month = _next_month(_state["last_generated"])
+    else:
+        _today = datetime.date.today()
+        target_month = f"{_today.year:04d}-{_today.month:02d}"
+
+    # Load special dates for this month
+    special_dates_for_month: dict = {}
+    if _SPECIAL_DATES_PATH.exists():
+        _all_special = json.loads(_SPECIAL_DATES_PATH.read_text(encoding="utf-8"))
+        special_dates_for_month = {
+            k: v for k, v in _all_special.items() if not k.startswith("_")
+        }.get(target_month, {})
+
     print(f"Excel: {excel_path}")
+    print(f"Target month: {target_month}")
+    if special_dates_for_month:
+        print(f"Special dates: {special_dates_for_month.get('notes', '')}")
 
     print("Loading teacher records...")
     records = load_teacher_records(excel_path)
     print(f"  {len(records)} records loaded.")
 
     print("Building CP-SAT model...")
-    ds = DutySolver(records, _CFG)
-    print(f"  {len(ds.x)} decision variables created.")
+    ds = DutySolver(records, _CFG, target_month, special_dates_for_month)
+    print(
+        f"  {len(ds._schedule_days)} duty days  |  "
+        f"{ds._num_weeks} weeks  |  "
+        f"{len(ds.x)} decision variables."
+    )
 
     print("Solving...")
     status = ds.solve()
@@ -702,4 +899,4 @@ if __name__ == "__main__":
 
     print("Exporting to Excel...")
     ds.export_to_excel(excel_path)
-    print(f"  结果已写入 '{_CFG['output']['output_sheet_name']}' sheet。")
+    print(f"  结果已写入 '{ds._output_sheet_name}' sheet。")
