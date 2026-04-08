@@ -29,6 +29,14 @@
 
 ## Completed
 
+### DONE-006 · 学科/星期偏好权重偏低 + 班主任学科加分未屏蔽
+- **Completed**: 2026-04-08
+- **Description**: `pref_english_mon_thu / pref_chinese_tue / pref_politics_wed` 由 50 提升至 200，
+  使学科偏好权重(200) > 偏差惩罚(80)，政治老师优先出现在周三。
+  同步修复隐性 bug：班主任教师原本也会获得学科/星期加分，导致提权后 SC-4(-200) 被学科加分(+200) 抵消，
+  蒋寅被排两次。修复方案：在三个学科偏好条件前加 `not t.is_banzhuren` 判断，落实"班主任标签优先于学科标签"。
+  求解时限同步调整 300s → 210s。
+
 ### DONE-005 · 真实日历时间轴 + 月份自动衔接 + 特殊日期支持
 - **Completed**: 2026-04-07
 - **Description**: 引入 `build_schedule_days()` 真实日历函数；新增 `scheduling_state.json` 和 `special_dates.json`；

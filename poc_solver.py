@@ -442,11 +442,12 @@ class DutySolver:
             if t.is_banzhuren and d not in (4, 6):
                 # SC-4: 班主任出现在非周末（含调休周六）时惩罚，净得分为负
                 terms.append(var * W["penalty_bz_non_weekend"])
-            if t.subject == "英语" and d in (0, 3):
+            # 班主任标签优先级高于学科标签：班主任不参与学科/星期偏好加分
+            if not t.is_banzhuren and t.subject == "英语" and d in (0, 3):
                 terms.append(var * W["pref_english_mon_thu"])
-            if t.subject == "语文" and d == 1:
+            if not t.is_banzhuren and t.subject == "语文" and d == 1:
                 terms.append(var * W["pref_chinese_tue"])
-            if t.subject == "政治" and d == 2:
+            if not t.is_banzhuren and t.subject == "政治" and d == 2:
                 terms.append(var * W["pref_politics_wed"])
 
         # --- SC-1: pref_non_banzhuren_double ---

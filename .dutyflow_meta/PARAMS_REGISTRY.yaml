@@ -75,7 +75,7 @@ solver:
   # Increased from 30 to 60 after adding HC-6 range constraints and spacing/deviation
   # soft terms, which significantly grow the search space.
   # Increased from 180 to 300 to allow more time for objective improvement.
-  time_limit_seconds: 300
+  time_limit_seconds: 210
 
   # Number of parallel search workers for CP-SAT
   # Set to 1 for fully deterministic output (no parallel search randomness)
@@ -212,9 +212,9 @@ output:
 weights:
   # 学科与日期偏好得分 (正向激励)
   pref_banzhuren_weekend: 100   # 班主任排在周五/周日
-  pref_english_mon_thu: 50      # 英语排在周一/周四
-  pref_chinese_tue: 50          # 语文排在周二
-  pref_politics_wed: 50         # 政治排在周三
+  pref_english_mon_thu: 200     # 英语排在周一/周四（权重高于偏差惩罚80，确保有余量时优先满足）
+  pref_chinese_tue: 200         # 语文排在周二（同上）
+  pref_politics_wed: 200        # 政治排在周三（同上）
 
   # 间隔与分配偏好 (正向激励)
   pref_spacing_gap: 30          # 两次值班间隔拉开(>=7天)的加分

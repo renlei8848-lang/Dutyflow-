@@ -1,7 +1,7 @@
 # DutyFlow (Degradation) — System Architecture
 
 > Audience: Claude Code (AI). For human-readable Chinese version, see `.dutyflow_meta（中文for开发者）/ARCHITECTURE.md`.
-> Last updated: 2026-04-07 (SC-4 penalty_bz_non_weekend + SC-5 penalty_non_bz_weekend_double added; time limit 180 s; rule micro-adjustments synced)
+> Last updated: 2026-04-08 (subject-day pref weights 50→200; BZ exempted from subject pref terms; time limit 300s→210s)
 
 ---
 
