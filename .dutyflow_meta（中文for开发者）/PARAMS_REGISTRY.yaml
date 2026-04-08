@@ -176,6 +176,24 @@ weights:
   # -150 使净值 = -30 → 求解器优先让无周末值班老师承担第二次
   penalty_non_bz_weekend_double: -150
 
+  # SC-6: 强制日（all_bz_required_days）存在时激活的班主任三项权重
+  # 仅当 mandatory_bz_count > 0 时使用；mandatory_bz_count == 0 时原系统路径零改动
+  #
+  # pref_bz_mon_thu_after_mandatory: 周一至周四奖励
+  #   周五/周日已在 _create_variables 强制日分支内硬排除，本项不再需要"胜过周末"。
+  #   新目的：在班主任必须被分配时（结构性需要）使周一至周四可接受，同时净分为负，
+  #   使求解器主动回避班主任，仅在结构性必要时才分配。
+  #   净值 = SC-4(-200) + SC-6(+200) + 二次(-30) + SC-3(-80) = -110 → 主动回避
+  pref_bz_mon_thu_after_mandatory: 200
+  #
+  # penalty_bz_second_duty: 第二次值班微弱处罚（任意日）
+  #   强制日已计为第一次，求解器分配的任何值班 = 第二次，给予轻微惩罚
+  penalty_bz_second_duty: -30
+  #
+  # penalty_bz_second_duty_weekend: 第二次值班恰在周五/周日时的额外较大处罚
+  #   净效果：周末奖励(+100) + 二次(-30) + 二次周末(-100) = -30 → 优化器回避
+  penalty_bz_second_duty_weekend: -100
+
 # ──────────────────────────────────────────────────────
 # 第 8 节：月均目标与极差约束参数
 # ──────────────────────────────────────────────────────
