@@ -1,7 +1,7 @@
 # DutyFlow (Degradation) — System Architecture
 
 > Audience: Claude Code (AI). For human-readable Chinese version, see `.dutyflow_meta（中文for开发者）/ARCHITECTURE.md`.
-> Last updated: 2026-04-08 (subject-day pref weights 50→200; BZ exempted from subject pref terms; time limit 300s→210s)
+> Last updated: 2026-04-08 (SC-6 mandatory-day BZ three-term block; HC-1 mandatory-day skip; two-system if/else pattern throughout; "全体班主任" merged cell center-aligned in Excel export)
 
 ---
 
@@ -135,6 +135,7 @@ Each school day requires coverage on 3 floor zones:
 
 ### Hard constraints
 1. **HC-1 — Coverage**: Every slot every active day must have exactly the required headcount.
+   Exception: mandatory BZ days (`all_bz_required_days` with `mandatory_bz_count > 0`) are skipped — no solver variables exist for those days; duty is covered collectively by all BZ teachers.
 2. **HC-2 — No-clone**: A teacher can be assigned to at most 1 slot per day.
 3. **HC-3 — Weekly cap**: At most 1 duty per teacher per week.
 4. **HC-4 — Monthly cap**: At most 1 duty if tagged "一个月只能1次", else at most 2.
@@ -153,6 +154,12 @@ Each school day requires coverage on 3 floor zones:
 - **SC-3** `penalty_avg_deviation` (−80): penalizes `|new_count − monthly_target|` per teacher.
 - **SC-4** `penalty_bz_non_weekend` (−200): penalizes BZ teacher assigned on Mon–Thu. Net score even with subject pref (+50) and spacing (+30) is negative; solver avoids weekday BZ assignments.
 - **SC-5** `penalty_non_bz_weekend_double` (−150): penalizes non-BZ teacher who has ≥1 Fri/Sun assignment AND ≥2 total assignments this cycle. Discourages giving a non-BZ teacher a 2nd duty after they already have a Fri/Sun duty.
+- **SC-6** *(activated only when `mandatory_bz_count > 0`)* — Three sub-terms per BZ variable:
+  - `penalty_bz_second_duty` (−30): mild penalty for any solver-assigned BZ duty (counts as 2nd+ overall duty since mandatory days already contribute 1+).
+  - `penalty_bz_second_duty_weekend` (−100): additional larger penalty if Fri/Sun (d∈{4,6}).
+  - `pref_bz_mon_thu_after_mandatory` (+310): bonus if Mon–Thu (d∈{0,1,2,3}).
+  - Net: Mon–Thu = SC-4(−200)+SC-6(+310)+second(−30) = **+80**; Fri/Sun = weekend(+100)+second(−30)+weekend_penalty(−100) = **−30**.
+  - When `mandatory_bz_count == 0`: entire SC-6 block is skipped; original system unchanged.
 
 ---
 

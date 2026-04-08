@@ -29,6 +29,15 @@
 
 ## Completed
 
+### DONE-007 · 全体班主任强制日三联动功能
+- **Completed**: 2026-04-08
+- **Description**: 实现三个联动功能：
+  1. **Feature 1（HC-4/SC-3 配额抵扣）**：`mandatory_bz_count = len(all_bz_required_days ∩ 当月)`；当 > 0 时，班主任 `solver_cap = max(0, raw_cap − mandatory_bz_count)`，SC-3 目标值同步减少，强制日已计入月次数。
+  2. **Feature 2（Excel 合并"全体班主任"）**：`_create_variables` 中强制日抑制所有教师变量（原仅抑制班主任）；HC-1 跳过强制日覆盖率约束；`export_to_excel` 在强制日行合并 B-D 列，写"全体班主任"，FFB300 橙黄填充，水平+垂直居中对齐。
+  3. **Feature 3（SC-6）**：`mandatory_bz_count > 0` 时激活三项权重：`penalty_bz_second_duty(−30)`（任意天微弱处罚）、`penalty_bz_second_duty_weekend(−100)`（周五/周日额外较大处罚）、`pref_bz_mon_thu_after_mandatory(+310)`（周一至周四奖励）。
+  - **设计原则**：两套系统 + if 判断；`mandatory_bz_count == 0` 时所有 else 分支走原路径，原系统零改动。
+  - **新增 PARAMS_REGISTRY.yaml 权重**：`pref_bz_mon_thu_after_mandatory: 310`、`penalty_bz_second_duty: -30`、`penalty_bz_second_duty_weekend: -100`。
+
 ### DONE-006 · 学科/星期偏好权重偏低 + 班主任学科加分未屏蔽
 - **Completed**: 2026-04-08
 - **Description**: `pref_english_mon_thu / pref_chinese_tue / pref_politics_wed` 由 50 提升至 200，

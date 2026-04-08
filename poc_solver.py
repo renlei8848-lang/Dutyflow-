@@ -62,7 +62,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import yaml
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, PatternFill
 from ortools.sat.python import cp_model
 
 from poc_loader import TeacherRecord, load_teacher_records
@@ -233,6 +233,14 @@ class DutySolver:
             date.fromisoformat(s) for s in special_cfg.get("all_bz_required_days", [])
         }
 
+        # Number of mandatory BZ days falling in the target month.
+        # When > 0, activates the two-system branch in _create_variables / HC-1 / HC-4 / SC-3 / SC-6.
+        # When == 0, all original code paths are taken unchanged.
+        self._mandatory_bz_count: int = sum(
+            1 for d in self._all_bz_days
+            if d.year == year and d.month == month
+        )
+
         # Output sheet name, e.g. "2026年5月排班（暂定）"
         sheet_fmt: str = config["output"]["output_sheet_name_format"]
         self._output_sheet_name: str = (
@@ -281,9 +289,21 @@ class DutySolver:
             for sd in self._schedule_days:
                 w = sd.week_idx
                 d = sd.day_of_week
-                # Suppress BZ variables on all-BZ mandatory attendance days
-                if t.is_banzhuren and sd.date in self._all_bz_days:
-                    continue
+                # Mandatory-day variable suppression (two-system branch):
+                if self._mandatory_bz_count > 0:
+                    # New path: suppress ALL teachers on mandatory days (全体班主任 covers the duty)
+                    if sd.date in self._all_bz_days:
+                        continue
+                    # Hard-exclude BZ from Fri/Sun when mandatory days exist.
+                    # Soft penalty proved insufficient: SC-5 savings for non-BZ (+150)
+                    # outweighed the weekend penalty (-110 net), causing solver to
+                    # place BZ on weekends. Hard exclusion within this branch is cleaner.
+                    if t.is_banzhuren and d in (4, 6):
+                        continue
+                else:
+                    # Original path: suppress only BZ teachers (兼容旧行为)
+                    if t.is_banzhuren and sd.date in self._all_bz_days:
+                        continue
                 if d == 4 and "不要周五" in t.tags:
                     continue
                 if d == 6 and "不要周日" in t.tags:
@@ -307,27 +327,37 @@ class DutySolver:
             if not all_vars:
                 continue
 
-            cap = 1 if "一个月只能1次" in t.tags else 2
+            raw_cap = 1 if "一个月只能1次" in t.tags else 2
+            # Two-system: when mandatory BZ days exist, BZ teachers' solver quota is reduced
+            # by mandatory_bz_count (those days already count as duties).
+            if self._mandatory_bz_count > 0 and t.is_banzhuren:
+                solver_cap = max(0, raw_cap - self._mandatory_bz_count)
+            else:
+                solver_cap = raw_cap  # original path
 
-            new_total = self.model.NewIntVar(0, cap, f"new_total_{tid}")
+            new_total = self.model.NewIntVar(0, solver_cap, f"new_total_{tid}")
             self.model.Add(new_total == sum(all_vars))
             self._new_total[tid] = new_total
 
             # Friday vars (d == 4)
             fri_vars = [v for (i, w, d, s), v in self.x.items() if i == tid and d == 4]
-            new_friday = self.model.NewIntVar(0, cap, f"new_fri_{tid}")
+            new_friday = self.model.NewIntVar(0, solver_cap, f"new_fri_{tid}")
             self.model.Add(new_friday == (sum(fri_vars) if fri_vars else 0))
             self._new_friday[tid] = new_friday
 
             # Sunday vars (d == 6)
             sun_vars = [v for (i, w, d, s), v in self.x.items() if i == tid and d == 6]
-            new_sunday = self.model.NewIntVar(0, cap, f"new_sun_{tid}")
+            new_sunday = self.model.NewIntVar(0, solver_cap, f"new_sun_{tid}")
             self.model.Add(new_sunday == (sum(sun_vars) if sun_vars else 0))
             self._new_sunday[tid] = new_sunday
 
     def _add_hard_constraints(self) -> None:
         # HC-1: Coverage — every duty day × slot must have exactly required_headcount teachers
         for sd in self._schedule_days:
+            # Mandatory BZ days have no solver variables (全体班主任 covers collectively);
+            # skip coverage constraint for those days to avoid empty-slot RuntimeError.
+            if self._mandatory_bz_count > 0 and sd.date in self._all_bz_days:
+                continue
             w, d = sd.week_idx, sd.day_of_week
             for slot_id in SLOT_IDS:
                 slot_vars = [
@@ -372,8 +402,13 @@ class DutySolver:
             all_vars = [v for (tid, *_), v in self.x.items() if tid == t.teacher_id]
             if not all_vars:
                 continue
-            cap = 1 if "一个月只能1次" in t.tags else 2
-            self.model.Add(sum(all_vars) <= cap)
+            raw_cap = 1 if "一个月只能1次" in t.tags else 2
+            # Two-system: BZ solver quota reduced by mandatory_bz_count when mandatory days exist
+            if self._mandatory_bz_count > 0 and t.is_banzhuren:
+                solver_cap = max(0, raw_cap - self._mandatory_bz_count)
+            else:
+                solver_cap = raw_cap  # original path
+            self.model.Add(sum(all_vars) <= solver_cap)
 
         # HC-5: Weekend mutual exclusion — Friday duties + Sunday duties <= 1
         for t in self._records:
@@ -491,8 +526,14 @@ class DutySolver:
             tid = t.teacher_id
             if tid not in self._new_total:
                 continue
-            target = self._bz_target if t.is_banzhuren else self._non_bz_target
-            cap = 1 if "一个月只能1次" in t.tags else 2
+            raw_cap = 1 if "一个月只能1次" in t.tags else 2
+            # Two-system: when mandatory days exist, BZ target and cap are reduced by mandatory_bz_count
+            if self._mandatory_bz_count > 0 and t.is_banzhuren:
+                target = max(0, self._bz_target - self._mandatory_bz_count)
+                cap = max(0, raw_cap - self._mandatory_bz_count)
+            else:
+                target = self._bz_target if t.is_banzhuren else self._non_bz_target
+                cap = raw_cap  # original path
             max_dev = max(target, cap)
             dev_var = self.model.NewIntVar(0, max_dev, f"dev_{tid}")
             diff_lb = -target
@@ -515,6 +556,28 @@ class DutySolver:
                 wad >= self._new_friday[tid] + self._new_sunday[tid] + self._new_total[tid] - 2
             )
             terms.append(wad * W["penalty_non_bz_weekend_double"])
+
+        # --- SC-6: mandatory-day BZ preference block (purely additive, original path untouched) ---
+        # Activated only when mandatory_bz_count > 0.
+        # Any solver-assigned BZ duty = 2nd+ overall duty (mandatory days already counted as 1st).
+        # Three sub-terms per variable:
+        #   · penalty_bz_second_duty       — mild penalty for any BZ solver assignment
+        #   · penalty_bz_second_duty_weekend — additional larger penalty if Fri/Sun (d∈{4,6})
+        #   · pref_bz_mon_thu_after_mandatory — bonus if Mon–Thu (d∈{0,1,2,3})
+        # Net scores (combined with existing SC-4 / pref_banzhuren_weekend from above):
+        #   Mon–Thu : SC-4(−200) + SC-6(+310) + second_duty(−30) = +80  → acceptable
+        #   Fri/Sun : weekend(+100) + second_duty(−30) + second_weekend(−100) = −30 → avoided
+        #   Sat(d=5): SC-4(−200) + second_duty(−30) = −230 → extremely unlikely
+        if self._mandatory_bz_count > 0:
+            for (tid, w, d, slot_id), var in self.x.items():
+                t = self._by_id[tid]
+                if not t.is_banzhuren:
+                    continue
+                terms.append(var * W["penalty_bz_second_duty"])
+                if d in (4, 6):
+                    terms.append(var * W["penalty_bz_second_duty_weekend"])
+                elif d in (0, 1, 2, 3):
+                    terms.append(var * W["pref_bz_mon_thu_after_mandatory"])
 
         if terms:
             self.model.Maximize(sum(terms))
@@ -565,6 +628,9 @@ class DutySolver:
 
         # HC-1: Coverage
         for sd in self._schedule_days:
+            # Mandatory BZ days have no solver variables — skip HC-1 check (same as model build)
+            if self._mandatory_bz_count > 0 and sd.date in self._all_bz_days:
+                continue
             w, d = sd.week_idx, sd.day_of_week
             for slot_id in SLOT_IDS:
                 count = sum(
@@ -609,15 +675,19 @@ class DutySolver:
 
         # HC-4: Monthly cap
         for t in self._records:
-            cap = 1 if "一个月只能1次" in t.tags else 2
+            raw_cap = 1 if "一个月只能1次" in t.tags else 2
+            if self._mandatory_bz_count > 0 and t.is_banzhuren:
+                solver_cap = max(0, raw_cap - self._mandatory_bz_count)
+            else:
+                solver_cap = raw_cap  # original path
             total = sum(
                 solver.Value(self.x[key])
                 for key in self.x
                 if key[0] == t.teacher_id
             )
-            if total > cap:
+            if total > solver_cap:
                 violations.append(
-                    f"HC-4 FAIL: {t.name} 月总次数{total}，上限{cap}"
+                    f"HC-4 FAIL: {t.name} 月总次数{total}，上限{solver_cap}"
                 )
 
         # HC-5: Weekend mutex
@@ -799,19 +869,28 @@ class DutySolver:
 
         rows: list[dict] = []
         unassigned_placeholder: str = self._config["output"]["unassigned_placeholder"]
+        # Track Excel row numbers (1-based; row 1 = header, data starts at row 2)
+        # for mandatory BZ days so we can merge B-D after writing.
+        mandatory_row_indices: list[int] = []
 
-        for sd in self._schedule_days:
+        for excel_row, sd in enumerate(self._schedule_days, start=2):
             w, d = sd.week_idx, sd.day_of_week
-            row: dict[str, str] = {"日期": self._date_label(w, d)}
-            for slot_id in SLOT_IDS:
-                zone = SLOT_ZONE[slot_id]
-                assigned_name = unassigned_placeholder
-                for tid, t in self._by_id.items():
-                    if (tid, w, d, slot_id) in self.x:
-                        if self.cp_solver.Value(self.x[(tid, w, d, slot_id)]) == 1:
-                            assigned_name = t.name
-                            break
-                row[zone] = assigned_name
+            label = self._date_label(w, d)
+            # Two-system: mandatory days get a placeholder row; normal days get individual assignments
+            if self._mandatory_bz_count > 0 and sd.date in self._all_bz_days:
+                row: dict[str, str] = {"日期": label, "1楼": "全体班主任", "2-3楼": "", "4-5楼": ""}
+                mandatory_row_indices.append(excel_row)
+            else:
+                row = {"日期": label}
+                for slot_id in SLOT_IDS:
+                    zone = SLOT_ZONE[slot_id]
+                    assigned_name = unassigned_placeholder
+                    for tid, t in self._by_id.items():
+                        if (tid, w, d, slot_id) in self.x:
+                            if self.cp_solver.Value(self.x[(tid, w, d, slot_id)]) == 1:
+                                assigned_name = t.name
+                                break
+                    row[zone] = assigned_name
             rows.append(row)
 
         df = pd.DataFrame(rows, columns=["日期", "1楼", "2-3楼", "4-5楼"])
@@ -836,6 +915,16 @@ class DutySolver:
                     cell = ws.cell(row=row_idx, column=col_idx)
                     if cell.value in banzhuren_names:
                         cell.fill = orange_yellow
+
+            # Merge B-D for mandatory BZ days and apply "全体班主任" with orange-yellow fill.
+            # Must run after the BZ individual-cell fill loop (mandatory rows are not in
+            # banzhuren_names so the loop above is a no-op for them; this pass overrides correctly).
+            for r in mandatory_row_indices:
+                ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+                merged_cell = ws.cell(row=r, column=2)
+                merged_cell.value = "全体班主任"
+                merged_cell.fill = orange_yellow
+                merged_cell.alignment = Alignment(horizontal="center", vertical="center")
 
         del df
 
